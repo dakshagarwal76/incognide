@@ -87,6 +87,7 @@ import { Modal, Tabs, Card, Button, Input, Select, createWindowApiDatabaseClient
 ChartJS.register(ArcElement, Tooltip, Legend, CategoryScale, LinearScale, BarElement, PointElement, LineElement);
 import * as LucideIcons from 'lucide-react';
 import { useActivityTracker } from './ActivityTracker';
+import { useKeystrokeLogger } from '../hooks/useKeystrokeLogger';
 import ActivityTrackerDashboard from './ActivityTracker';
 import BrowserSettingsManager from './BrowserSettingsManager';
 import ModelManager from './ModelManager';
@@ -274,6 +275,7 @@ const ChatInterface = ({ onRerunSetup }: { onRerunSetup?: () => void }) => {
 
 
     const { trackActivity } = useActivityTracker();
+    const { flushAll } = useKeystrokeLogger();
 
 
     useEffect(() => {
@@ -314,7 +316,7 @@ const ChatInterface = ({ onRerunSetup }: { onRerunSetup?: () => void }) => {
             document.removeEventListener('keydown', handleKeydown, { capture: false });
             document.removeEventListener('blur', handleBlur, { capture: true });
         };
-    }, [trackActivity]);
+    }, [trackActivity, flushAll]);
 
 
     const [openMode, setOpenMode] = useState<'pane' | 'tab'>(() => (localStorage.getItem('incognide_openMode') as 'pane' | 'tab') || 'pane');
@@ -1705,10 +1707,21 @@ const handleOpenHelpEvent = () => createHelpPaneRef.current?.();
             }
         };
 
-        window.addEventListener('beforeunload', saveCurrentWorkspace);
+        const handleBeforeUnload = () => {
+            saveCurrentWorkspace();
+            flushAll();
+            for (const paneId of Object.keys(contentDataRef.current)) {
+                const pd = contentDataRef.current[paneId];
+                if (pd?.contentType === 'editor' && pd?.fileChanged && pd?.onSave) {
+                    pd.onSave();
+                }
+            }
+        };
+
+        window.addEventListener('beforeunload', handleBeforeUnload);
 
         return () => {
-            window.removeEventListener('beforeunload', saveCurrentWorkspace);
+            window.removeEventListener('beforeunload', handleBeforeUnload);
         };
     }, [currentPath, rootLayoutNode, openMode]);
     useEffect(() => {
@@ -2773,7 +2786,20 @@ const handleSaveChat = useCallback(async () => {
     }
 }, [activeContentPaneId, currentPath]);
 
-const renderFileEditor = useCallback(({ nodeId }) => {
+    const renderFileVersionsPane = useCallback(({ nodeId }: { nodeId: string }) => {
+        const paneData = contentDataRef.current[nodeId];
+        if (!paneData?.contentId) {
+            return <div className="flex-1 flex items-center justify-center theme-text-muted">No file selected</div>;
+        }
+        return (
+            <FileVersionsPane
+                filePath={paneData.contentId}
+                currentPath={currentPath}
+            />
+        );
+    }, [currentPath]);
+
+    const renderFileEditor = useCallback(({ nodeId }) => {
     const paneData = contentDataRef.current[nodeId];
     if (!paneData || (!paneData.contentId && !paneData.isUntitled)) {
         return <div className="flex-1 flex items-center justify-center theme-text-muted">No file selected</div>;
@@ -6611,6 +6637,7 @@ const paneRenderers = useMemo(() => ({
     'html-preview': renderHtmlPreviewPane,
     tilejinx: renderTileJinxPane,
     python: renderTerminalView,
+    file_versions: renderFileVersionsPane,
     account: renderAccountPane,
     activity: renderActivityPane,
     browsersettings: renderBrowserSettingsPane,
@@ -6627,6 +6654,7 @@ const paneRenderers = useMemo(() => ({
     renderCronDaemonPane, renderSearchPane, renderMarkdownPreviewPane, renderHtmlPreviewPane,
     renderTileJinxPane,
     renderBrowserSettingsPane, renderModelManagerPane, renderVoiceManagerPane,
+    renderFileVersionsPane,
 ]);
 
 const layoutComponentApi = useMemo(() => ({

@@ -580,6 +580,10 @@ readPdfText: (filePath) =>
     knowledge_extractAndStore: (args) => ipcRenderer.invoke('knowledge:extractAndStore', args),
 
     logActivity: (args) => ipcRenderer.invoke('activity:log', args),
+    logActivityBatch: (args) => ipcRenderer.invoke('activity:log-batch', args),
+    recordVersion: (args) => ipcRenderer.invoke('versions:record', args),
+    listVersions: (args) => ipcRenderer.invoke('versions:list', args),
+    readVersion: (args) => ipcRenderer.invoke('versions:read', args),
     getActivities: (args) => ipcRenderer.invoke('activity:list', args),
     logAutocomplete: (args) => ipcRenderer.invoke('autocomplete:log', args),
     getAutocompleteStats: (args) => ipcRenderer.invoke('autocomplete:stats', args),

@@ -1459,6 +1459,34 @@ function register(ctx) {
     } catch (err) { return { error: err.message }; }
   });
 
+  ipcMain.handle('activity:log-batch', async (event, rows) => {
+    try {
+      const now = new Date().toISOString();
+      const placeholders = [];
+      const params = [];
+      for (const data of (rows || [])) {
+        placeholders.push('(?, ?, ?, ?, ?, ?, ?)');
+        params.push(
+          data.type || 'unknown',
+          JSON.stringify(data.data || {}),
+          data.directoryPath || null,
+          data.npc || null,
+          data.deviceId || null,
+          data.sessionId || null,
+          now
+        );
+      }
+      if (placeholders.length === 0) return { success: true, count: 0 };
+      await dbQuery(
+        `INSERT INTO activity_log (activity_type, activity_data, directory_path, npc, device_id, session_id, timestamp) VALUES ${placeholders.join(', ')}`,
+        params
+      );
+      return { success: true, count: rows.length };
+    } catch (err) {
+      return { error: err.message };
+    }
+  });
+
   ipcMain.handle('activity:list', async (event, data = {}) => {
     try {
       const limit = data.limit || 100;

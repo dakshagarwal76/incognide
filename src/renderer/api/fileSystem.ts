@@ -82,11 +82,16 @@ export async function readFileContent(filePath: string) {
     return (window as any).api.readFileContent(filePath);
 }
 
-export async function writeFileContent(filePath: string, content: string) {
-    if (_activeConnectionId) {
-        return (window as any).api.sshWriteFile({ id: _activeConnectionId, filePath, content });
+export async function writeFileContent(filePath: string, content: string, origin: 'manual' | 'autosave' | 'rollback' = 'manual', recordVersion: boolean = true) {
+    const result = _activeConnectionId
+        ? await (window as any).api.sshWriteFile({ id: _activeConnectionId, filePath, content })
+        : await (window as any).api.writeFileContent(filePath, content);
+    if (recordVersion && filePath && origin !== 'autosave') {
+        (window as any).api.recordVersion?.({ filePath, content, origin }).catch((err: any) => {
+            console.error('[writeFileContent] version record failed:', err);
+        });
     }
-    return (window as any).api.writeFileContent(filePath, content);
+    return result;
 }
 
 export async function renameFile(oldPath: string, newPath: string) {

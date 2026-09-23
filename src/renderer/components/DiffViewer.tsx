@@ -19,6 +19,10 @@ interface DiffViewerProps {
     onStage?: () => void;
     onUnstage?: () => void;
     onDiscard?: () => void;
+    leftContent?: string;
+    rightContent?: string;
+    leftLabel?: string;
+    rightLabel?: string;
 }
 
 interface MergeConflict {
@@ -39,7 +43,11 @@ const DiffViewer: React.FC<DiffViewerProps> = ({
     currentPath,
     onStage,
     onUnstage,
-    onDiscard
+    onDiscard,
+    leftContent,
+    rightContent,
+    leftLabel,
+    rightLabel,
 }) => {
     const [originalContent, setOriginalContent] = useState<string>('');
     const [modifiedContent, setModifiedContent] = useState<string>('');
@@ -129,6 +137,18 @@ const DiffViewer: React.FC<DiffViewerProps> = ({
     const loadContent = async () => {
         setLoading(true);
         setError(null);
+        if (leftContent != null || rightContent != null) {
+            setOriginalContent(leftContent ?? '');
+            setModifiedContent(rightContent ?? '');
+            const conflicts = detectMergeConflicts(rightContent ?? '');
+            setMergeConflicts(conflicts);
+            if (conflicts.length > 0 && viewMode !== 'conflicts') {
+                setViewMode('conflicts');
+            }
+            setLoading(false);
+            setHasUnsavedResolutions(false);
+            return;
+        }
         try {
             const repoPath = currentPath || filePath.replace(/\\/g, '/').split('/').slice(0, -1).join('/');
             const relativePath = filePath.replace(repoPath + '/', '').replace(repoPath, '');
@@ -367,7 +387,7 @@ const DiffViewer: React.FC<DiffViewerProps> = ({
             <div className="flex flex-1 min-h-0">
                 <div className="flex-1 flex flex-col border-r theme-border min-w-0">
                     <div className="px-2 py-1 text-[10px] font-medium text-pink-300 bg-pink-900/20 flex items-center gap-1">
-                        <GitBranch size={10} /> Original (HEAD)
+                        <GitBranch size={10} /> {leftLabel || 'Original (HEAD)'}
                     </div>
                     <div className="flex flex-1 min-h-0">
                         <div
@@ -383,7 +403,7 @@ const DiffViewer: React.FC<DiffViewerProps> = ({
 
                 <div className="flex-1 flex flex-col min-w-0">
                     <div className="px-2 py-1 text-[10px] font-medium text-teal-300 bg-teal-900/20 flex items-center gap-1">
-                        <GitBranch size={10} /> Modified (Working Copy)
+                        <GitBranch size={10} /> {rightLabel || 'Modified (Working Copy)'}
                         {mergeConflicts.length > 0 && (
                             <span className="ml-auto flex items-center gap-1 text-yellow-400">
                                 <AlertTriangle size={10} /> {mergeConflicts.length} conflict{mergeConflicts.length !== 1 ? 's' : ''}
@@ -629,6 +649,8 @@ const DiffViewer: React.FC<DiffViewerProps> = ({
                     >
                         <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
                     </button>
+                    {(leftContent == null && rightContent == null) && (
+                    <>
                     <button
                         onClick={handleStage}
                         className="px-2 py-1 text-xs bg-teal-600 hover:bg-teal-700 rounded flex items-center gap-1"
@@ -643,6 +665,8 @@ const DiffViewer: React.FC<DiffViewerProps> = ({
                     >
                         <Undo2 size={12} /> Discard
                     </button>
+                    </>
+                    )}
                 </div>
             </div>
 

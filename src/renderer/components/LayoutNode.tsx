@@ -7,7 +7,7 @@ import {
     Image as ImageIcon, Tag, Folder, Users, Settings, Images, BookOpen,
     FolderCog, HardDrive, Tags, Network, LayoutDashboard, Share2, Maximize2, Minimize2,
     FlaskConical, HelpCircle, Search, Music, Save, ZoomIn, ZoomOut, RotateCw, RefreshCw,
-    Box, Grid3X3, Eye, EyeOff, RotateCcw, Video
+    Box, Grid3X3, Eye, EyeOff, RotateCcw, Video, History
 } from 'lucide-react';
 import PaneHeader from './PaneHeader';
 import PaneTabBar from './PaneTabBar';
@@ -15,6 +15,7 @@ import { getFileName, getFileIcon } from './utils';
 import ChatInput from './ChatInput';
 import AgentInput from './AgentInput';
 import DiffViewer from './DiffViewer';
+import FileVersionsPane from './FileVersionsPane';
 import { ChatHeaderContent } from './pane-headers';
 
 const generateLayoutId = () => `layout-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -1299,6 +1300,9 @@ export const LayoutNode = memo(({ node, path, component: componentRef }) => {
         } else if (contentType === 'diff') {
             headerIcon = <GitBranch size={14} className="text-orange-400" />;
             headerTitle = `Diff: ${getFileName(contentId) || 'File'}`;
+        } else if (contentType === 'file_versions') {
+            headerIcon = <History size={14} className="text-blue-400" />;
+            headerTitle = `Versions: ${getFileName(contentId) || 'File'}`;
         } else if (contentId) {
             headerIcon = getFileIcon(contentId);
             headerTitle = getFileName(contentId);
@@ -1336,6 +1340,19 @@ export const LayoutNode = memo(({ node, path, component: componentRef }) => {
                         title="Save file (Ctrl+S)"
                     >
                         <Save size={12} />
+                    </button>
+                    <button
+                        onClick={(e) => {
+                            e.stopPropagation();
+                            const nodePath = findNodePath(rootLayoutNode, node.id);
+                            if (nodePath) {
+                                performSplit(nodePath, 'right', 'file_versions', contentId);
+                            }
+                        }}
+                        className="p-1 rounded text-xs theme-button theme-hover"
+                        title="View file version history"
+                    >
+                        <History size={12} />
                     </button>
                     {isMarkdownFile && (
                         <button
@@ -1625,6 +1642,14 @@ export const LayoutNode = memo(({ node, path, component: componentRef }) => {
                     <DiffViewer
                         filePath={contentId || ''}
                         diffStatus={paneData?.diffStatus}
+                        currentPath={currentPath}
+                    />
+                );
+            }
+            if (contentType === 'file_versions') {
+                return (
+                    <FileVersionsPane
+                        filePath={contentId || ''}
                         currentPath={currentPath}
                     />
                 );

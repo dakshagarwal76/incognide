@@ -1,5 +1,6 @@
 import { getFileName } from './utils';
 import { useAiEnabled } from './AiFeatureContext';
+import { useKeystrokeLogger } from '../hooks/useKeystrokeLogger';
 import { readFileContent, writeFileContent } from '../api/fileSystem';
 import React, { useMemo, useCallback, useRef, useEffect, useState, memo } from 'react';
 import { createPortal } from 'react-dom';
@@ -20,7 +21,7 @@ import { EditorState } from '@codemirror/state';
 import { tags as t } from '@lezer/highlight';
 import { autocompletion, completionKeymap, closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
 import { lintKeymap, linter, lintGutter, type Diagnostic } from '@codemirror/lint';
-import { Edit, FileText, MessageSquare, GitBranch, X, Play, HelpCircle, RefreshCw, ChevronDown, Bot } from 'lucide-react';
+import { Edit, FileText, MessageSquare, GitBranch, X, Play, HelpCircle, RefreshCw, ChevronDown, Bot, History } from 'lucide-react';
 
 const appHighlightStyleDark = HighlightStyle.define([
     { tag: t.keyword, color: '#c678dd' },
@@ -399,7 +400,7 @@ const editorThemeLight = EditorView.theme({
     },
 });
 
-const CodeMirrorEditor = memo(({ value, onChange, filePath, onSave, onContextMenu, onSelect, onSendToTerminal, savedEditorState, onEditorStateChange, keybindMode }) => {
+const CodeMirrorEditor = memo(({ value, onChange, filePath, onSave, onContextMenu, onSelect, onSendToTerminal, savedEditorState, onEditorStateChange, keybindMode, appendKeystrokes, flushAll }) => {
     const editorRef = useRef(null);
 
     const onSelectRef = useRef(onSelect);
@@ -407,11 +408,15 @@ const CodeMirrorEditor = memo(({ value, onChange, filePath, onSave, onContextMen
     const onSendToTerminalRef = useRef(onSendToTerminal);
     const onSaveRef = useRef(onSave);
     const onEditorStateChangeRef = useRef(onEditorStateChange);
+    const appendKeystrokesRef = useRef(appendKeystrokes);
+    const flushAllRef = useRef(flushAll);
     onSelectRef.current = onSelect;
     onContextMenuRef.current = onContextMenu;
     onSendToTerminalRef.current = onSendToTerminal;
     onSaveRef.current = onSave;
     onEditorStateChangeRef.current = onEditorStateChange;
+    appendKeystrokesRef.current = appendKeystrokes;
+    flushAllRef.current = flushAll;
 
     const [isDarkMode, setIsDarkMode] = useState(() => !document.body.classList.contains('light-mode'));
 
@@ -575,6 +580,30 @@ const CodeMirrorEditor = memo(({ value, onChange, filePath, onSave, onContextMen
     }, [keybindMode]);
 
     const initialScrollPosRef = useRef(savedEditorState?.scrollTopPos ?? 0);
+    const keystrokeCounterPlugin = useMemo(() => {
+        const appendRef = appendKeystrokesRef;
+        return ViewPlugin.fromClass(class {
+            update(update: any) {
+                if (!update.docChanged || !appendRef.current) return;
+                const isUserInput = update.transactions.some((t: any) =>
+                    t.isUserEvent?.('input.type') ||
+                    t.isUserEvent?.('input.paste') ||
+                    t.isUserEvent?.('input.drop')
+                );
+                if (!isUserInput) return;
+                const inserted: string[] = [];
+                update.changes.iterChanges((_fromA: number, _toA: number, _fromB: number, _toB: number, insertedText: any) => {
+                    if (insertedText && insertedText.length > 0) {
+                        inserted.push(insertedText.toString());
+                    }
+                });
+                if (inserted.length > 0) {
+                    appendRef.current('editor', filePath || 'Untitled', inserted.join(''));
+                }
+            }
+        });
+    }, [filePath]);
+
     const scrollPreserverPlugin = useMemo(() => {
         const stateChangeRef = onEditorStateChangeRef;
         const posRef = initialScrollPosRef;
@@ -674,8 +703,16 @@ const CodeMirrorEditor = memo(({ value, onChange, filePath, onSave, onContextMen
 
         EditorView.lineWrapping,
 
+        EditorView.domEventHandlers({
+            blur: () => {
+                flushAllRef.current?.();
+            },
+        }),
+
+        keystrokeCounterPlugin,
+
         scrollPreserverPlugin,
-    ], [languageExtension, lintExtension, customKeymap, tabSize, keymapExtensions, vimExtension, isDarkMode]);
+    ], [languageExtension, lintExtension, customKeymap, tabSize, keymapExtensions, vimExtension, isDarkMode, filePath, keystrokeCounterPlugin]);
 
     const handleUpdate = useCallback((viewUpdate) => {
         if (viewUpdate.selectionSet && onSelectRef.current) {
@@ -782,7 +819,12 @@ const CodeEditorPane = ({
     onSendToTerminal,
 }) => {
     const aiEnabled = useAiEnabled();
+    const { appendKeystrokes, flushAll } = useKeystrokeLogger();
     const paneData = contentDataRef.current[nodeId];
+
+    useEffect(() => {
+        return () => { flushAll(); };
+    }, [flushAll]);
     const [showBlame, setShowBlame] = useState(false);
     const [blameData, setBlameData] = useState<any[] | null>(null);
     const [blameLoading, setBlameLoading] = useState(false);
@@ -912,7 +954,7 @@ const CodeEditorPane = ({
                     if (!inputFilename || inputFilename.trim() === '') return;
                     const cleanName = inputFilename.trim();
                     const filepath = `${currentPath}/${cleanName}`;
-                    await writeFileContent(filepath, currentPaneData.fileContent || '');
+                    await writeFileContent(filepath, currentPaneData.fileContent || '', 'manual');
 
                     currentPaneData.contentId = filepath;
                     currentPaneData.isUntitled = false;
@@ -940,7 +982,7 @@ const CodeEditorPane = ({
 
         currentPaneData._selfWriting = true;
         currentPaneData._lastWrittenContent = currentPaneData.fileContent;
-        await writeFileContent(currentPaneData.contentId, currentPaneData.fileContent);
+        await writeFileContent(currentPaneData.contentId, currentPaneData.fileContent || '', 'manual');
         currentPaneData.fileChanged = false;
         const newStats = await checkDiskState(currentPaneData.contentId);
         updateDiskState(currentPaneData.fileContent || '', newStats.mtime);
@@ -954,7 +996,7 @@ const CodeEditorPane = ({
         if (overwrite) {
             currentPaneData._selfWriting = true;
             currentPaneData._lastWrittenContent = currentPaneData.fileContent;
-            await writeFileContent(currentPaneData.contentId, currentPaneData.fileContent || '');
+            await writeFileContent(currentPaneData.contentId, currentPaneData.fileContent || '', 'manual');
             currentPaneData.fileChanged = false;
             const newStats = await checkDiskState(currentPaneData.contentId);
             updateDiskState(currentPaneData.fileContent || '', newStats.mtime);
@@ -979,32 +1021,44 @@ const CodeEditorPane = ({
 
     useEffect(() => {
         const currentPaneData = contentDataRef.current[nodeId];
-        if (!currentPaneData?.fileChanged || !currentPaneData?.contentId || currentPaneData?.isUntitled) return;
-        if (pendingDiskConflictRef.current) return;
-        const timer = setTimeout(async () => {
+        if (!currentPaneData?.contentId || currentPaneData?.isUntitled) return;
+        const timer = setInterval(async () => {
+            const pd = contentDataRef.current[nodeId];
+            if (!pd?.fileChanged || pendingDiskConflictRef.current) return;
             try {
-                const { mtime } = await checkDiskState(currentPaneData.contentId);
+                const { mtime } = await checkDiskState(pd.contentId);
                 if (diskMtimeRef.current != null && mtime !== 0 && mtime !== diskMtimeRef.current) {
                     pendingDiskConflictRef.current = true;
-                    const result = await readFileContent(currentPaneData.contentId);
+                    const result = await readFileContent(pd.contentId);
                     setDiskChangeContent(typeof result === 'string' ? result : result?.content ?? null);
                     setRootLayoutNode(p => ({ ...p }));
                     return;
                 }
-                currentPaneData._selfWriting = true;
-                currentPaneData._lastWrittenContent = currentPaneData.fileContent;
-                await writeFileContent(currentPaneData.contentId, currentPaneData.fileContent);
-                currentPaneData.fileChanged = false;
-                const newStats = await checkDiskState(currentPaneData.contentId);
-                updateDiskState(currentPaneData.fileContent || '', newStats.mtime);
+                pd._selfWriting = true;
+                pd._lastWrittenContent = pd.fileContent;
+                await writeFileContent(pd.contentId, pd.fileContent || '', 'autosave');
+                pd.fileChanged = false;
+                const newStats = await checkDiskState(pd.contentId);
+                updateDiskState(pd.fileContent || '', newStats.mtime);
                 setRootLayoutNode(p => ({ ...p }));
-                setTimeout(() => { currentPaneData._selfWriting = false; }, 4000);
+                setTimeout(() => { pd._selfWriting = false; }, 4000);
             } catch (e) {
-                currentPaneData._selfWriting = false;
+                pd._selfWriting = false;
             }
         }, 30000);
-        return () => clearTimeout(timer);
-    }, [fileContent, fileChanged, nodeId, contentDataRef, setRootLayoutNode, checkDiskState, updateDiskState]);
+        return () => {
+            clearInterval(timer);
+            const pd = contentDataRef.current[nodeId];
+            if (pd?.fileChanged && pd?.contentId && !pd?.isUntitled) {
+                pd._selfWriting = true;
+                pd._lastWrittenContent = pd.fileContent;
+                writeFileContent(pd.contentId, pd.fileContent || '', 'autosave').catch(() => {});
+                pd.fileChanged = false;
+                checkDiskState(pd.contentId).then(s => updateDiskState(pd.fileContent || '', s.mtime)).catch(() => {});
+                setTimeout(() => { pd._selfWriting = false; }, 4000);
+            }
+        };
+    }, [nodeId, contentDataRef, setRootLayoutNode, checkDiskState, updateDiskState]);
 
     const reloadFromDisk = useCallback(async () => {
         const pd = contentDataRef.current[nodeId];
@@ -1032,9 +1086,18 @@ const CodeEditorPane = ({
         const handleEscape = (e: KeyboardEvent) => {
             if (e.key === 'Escape') setEditorContextMenuPos(null);
         };
+        const handleRollback = async (e: any) => {
+            if (e.detail?.filePath && e.detail.filePath === contentDataRef.current[nodeId]?.contentId) {
+                await reloadFromDisk();
+            }
+        };
         window.addEventListener('keydown', handleEscape);
-        return () => window.removeEventListener('keydown', handleEscape);
-    }, []);
+        window.addEventListener('file-versions-rollback', handleRollback);
+        return () => {
+            window.removeEventListener('keydown', handleEscape);
+            window.removeEventListener('file-versions-rollback', handleRollback);
+        };
+    }, [nodeId, reloadFromDisk]);
 
     useEffect(() => {
         const currentPaneData = contentDataRef.current[nodeId];
@@ -1147,6 +1210,8 @@ const CodeEditorPane = ({
 
                 <div className="flex-1 overflow-hidden min-h-0 relative">
                     <CodeMirrorEditor
+                        appendKeystrokes={appendKeystrokes}
+                        flushAll={flushAll}
                         value={fileContent || ''}
                         onChange={onContentChange}
                         onSave={onSave}

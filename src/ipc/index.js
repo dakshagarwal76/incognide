@@ -13,6 +13,7 @@ const settings = require('./settings');
 const ssh = require('./ssh');
 const team = require('./team');
 const orcarouter = require('./orcarouter');
+const versions = require('./versions');
 
 function getIndexLocationFunctions() {
   return {
@@ -54,6 +55,7 @@ function registerAll(ctx) {
   settings.register(fullCtx);
   ssh.register(fullCtx);
   orcarouter.register(fullCtx);
+  versions.register(fullCtx);
 }
 
 module.exports = {

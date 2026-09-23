@@ -363,13 +363,33 @@ export function useLayoutManager({ trackActivity, openModeRef, paneUpdateEmitter
         }
     }, [updateContentPane]);
 
-    const closeContentPane = useCallback((paneId: string, nodePath?: number[]) => {
+    const closeContentPane = useCallback(async (paneId: string, nodePath?: number[]) => {
         const paneData = contentDataRef.current[paneId];
+
+        const triggerSaveFor = async (pane: any) => {
+            if (pane?.contentType === 'editor' || pane?.contentType === 'latex') {
+                if (pane?.fileChanged || pane?.hasChanges) {
+                    if (pane?.onSave) {
+                        try { await pane.onSave(); } catch {}
+                    }
+                }
+            }
+        };
 
         if (paneData && (paneData.fileChanged || paneData.hasChanges)) {
             const fileName = paneData.contentId?.split('/').pop() || 'this file';
-            if (!confirm(`"${fileName}" has unsaved changes. Close anyway?`)) {
-                return;
+            const isAutoSaveable = paneData.contentType === 'editor' || paneData.contentType === 'latex';
+            if (isAutoSaveable) {
+                await triggerSaveFor(paneData);
+                if (Array.isArray(paneData.tabs)) {
+                    for (const tab of paneData.tabs) {
+                        await triggerSaveFor(tab);
+                    }
+                }
+            } else {
+                if (!confirm(`"${fileName}" has unsaved changes. Close anyway?`)) {
+                    return;
+                }
             }
         }
 

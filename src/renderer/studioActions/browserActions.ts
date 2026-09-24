@@ -196,13 +196,29 @@ async function get_browser_content(
 
   const { paneId, data } = resolved;
 
-  if (!data.getPageContent) {
-    return { success: false, error: 'Page content method not available for this pane' };
+  let dataWithMethod = data;
+  if (!dataWithMethod.getPageContent) {
+    const waitStart = Date.now();
+    while (!dataWithMethod.getPageContent && Date.now() - waitStart < 2000) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      dataWithMethod = ctx.contentDataRef.current[paneId];
+    }
   }
 
-  const result = await data.getPageContent({
-    maxChars: args.maxChars ?? 100000,
-    includeInteractive: args.includeInteractive ?? true
+  if (!dataWithMethod?.getPageContent) {
+    return {
+      success: false,
+      error: `Page content method not available for browser pane ${paneId}. The browser may still be initializing.`,
+      paneId
+    };
+  }
+
+  const maxChars = args.maxChars ? parseInt(String(args.maxChars), 10) : 100000;
+  const includeInteractive = String(args.includeInteractive ?? 'true').toLowerCase() !== 'false';
+
+  const result = await dataWithMethod.getPageContent({
+    maxChars: Number.isNaN(maxChars) ? 100000 : maxChars,
+    includeInteractive
   });
   return { ...result, paneId };
 }
@@ -353,13 +369,13 @@ async function browser_eval(
   return { ...result, paneId };
 }
 
-registerAction('navigate', navigate);
-registerAction('browser_back', browser_back);
-registerAction('browser_forward', browser_forward);
-registerAction('get_browser_info', get_browser_info);
-registerAction('browser_click', browser_click);
-registerAction('browser_type', browser_type);
-registerAction('get_browser_content', get_browser_content);
-registerAction('browser_find_elements', browser_find_elements);
-registerAction('browser_screenshot', browser_screenshot);
-registerAction('browser_eval', browser_eval);
+registerAction('navigate', navigate, { description: 'Navigate the browser to a URL', paneTypes: ['browser'] });
+registerAction('browser_back', browser_back, { description: 'Go back in browser history', paneTypes: ['browser'] });
+registerAction('browser_forward', browser_forward, { description: 'Go forward in browser history', paneTypes: ['browser'] });
+registerAction('get_browser_info', get_browser_info, { description: 'Get current browser page info', paneTypes: ['browser'] });
+registerAction('browser_click', browser_click, { description: 'Click an element in the browser', paneTypes: ['browser'] });
+registerAction('browser_type', browser_type, { description: 'Type text into a browser element', paneTypes: ['browser'] });
+registerAction('get_browser_content', get_browser_content, { description: 'Get the page content from the browser', paneTypes: ['browser'] });
+registerAction('browser_find_elements', browser_find_elements, { description: 'Find elements on the browser page', paneTypes: ['browser'] });
+registerAction('browser_screenshot', browser_screenshot, { description: 'Take a browser screenshot', paneTypes: ['browser'] });
+registerAction('browser_eval', browser_eval, { description: 'Evaluate JavaScript in the browser', paneTypes: ['browser'] });

@@ -1013,13 +1013,17 @@ export const usePaneAwareStreamListeners = (
     getConversationStats: (messages: any[]) => any,
     refreshConversations: () => Promise<void>,
     studioContext?: StudioContext | null,
-    currentPath?: string
+    currentPath?: string,
+    onPermissionRequest?: (payload: any) => void
 ) => {
     const currentPathRef = useRef(currentPath);
     currentPathRef.current = currentPath;
 
     const studioContextRef = useRef(studioContext);
     studioContextRef.current = studioContext;
+
+    const onPermissionRequestRef = useRef(onPermissionRequest);
+    onPermissionRequestRef.current = onPermissionRequest;
 
     return useEffect(() => {
         console.log('[STREAM_LISTENER] Effect run. config?.stream:', !!config?.stream, 'listenersAttached:', listenersAttached.current);
@@ -1033,7 +1037,6 @@ export const usePaneAwareStreamListeners = (
 
         const saveAssistantMessage = (paneData: any, msg: any) => {
             const path = currentPathRef.current;
-            if (typeof path !== 'string' || !paneData?.contentId) return;
             const payload = {
                 message_id: msg.id,
                 timestamp: msg.timestamp || new Date().toISOString(),
@@ -1044,7 +1047,6 @@ export const usePaneAwareStreamListeners = (
                 model: msg.model,
                 provider: msg.provider,
                 npc: msg.npc,
-                parent_message_id: msg.parentMessageId,
                 execution_mode: paneData.executionMode,
                 input_tokens: msg.input_tokens,
                 output_tokens: msg.output_tokens,
@@ -1219,6 +1221,10 @@ export const usePaneAwareStreamListeners = (
                     message.input_tokens = u.input_tokens;
                     message.output_tokens = u.output_tokens;
                     message.cost = u.cost;
+                    paneData.chatStats = getConversationStats(paneData.chatMessages.allMessages);
+                    if (message.role === 'assistant') {
+                        saveAssistantMessage(paneData, message);
+                    }
                 };
 
                 if (typeof chunk === 'string') {
@@ -1233,6 +1239,18 @@ export const usePaneAwareStreamListeners = (
                             if (dataContent) {
                                 try {
                                     const parsed = JSON.parse(dataContent);
+                                    if (parsed.type === 'permission_request') {
+                                        // Server-side permission gate is waiting on a decision —
+                                        // surface it in the UI instead of dropping the event.
+                                        onPermissionRequestRef.current?.({ ...parsed, streamId: incomingStreamId, paneId: targetPaneId });
+                                        continue;
+                                    }
+                                    if (parsed.type === 'message_stop' || parsed.type === 'interrupt') {
+                                        // Backend signals end-of-stream explicitly; resolve now
+                                        // instead of waiting for socket EOF.
+                                        handleStreamComplete(null, { streamId: incomingStreamId });
+                                        continue;
+                                    }
                                     const result = processEvent(parsed, message.role === 'decision');
                                     if (result.content) appendText(result.content);
                                     if (result.reasoningContent) appendReasoning(result.reasoningContent);
@@ -1261,8 +1279,17 @@ export const usePaneAwareStreamListeners = (
                     if (toolCalls) appendToolCalls(Array.isArray(toolCalls) ? toolCalls : []);
                 } else if (chunk?.type) {
                     const type = chunk.type;
+                    if (type === 'permission_request') {
+                        onPermissionRequestRef.current?.({ ...chunk, streamId: incomingStreamId, paneId: targetPaneId });
+                        return;
+                    }
+                    if (type === 'message_stop' || type === 'interrupt') {
+                        handleStreamComplete(null, { streamId: incomingStreamId });
+                        return;
+                    }
                     if (type === 'usage') {
                         applyUsage({ input_tokens: chunk.input_tokens || 0, output_tokens: chunk.output_tokens || 0, cost: chunk.cost || 0 });
+                        paneData.chatStats = getConversationStats(paneData.chatMessages.allMessages);
                     } else if (type === 'tool_execution_start' && Array.isArray(chunk.tool_calls)) {
                         appendToolCalls(chunk.tool_calls);
                     } else if ((type === 'tool_start' || type === 'tool_complete' || type === 'tool_result' || type === 'tool_error') && chunk.name) {
@@ -1351,6 +1378,9 @@ export const usePaneAwareStreamListeners = (
                         saveAssistantMessage(paneData, msg);
                     }
                     paneData.chatStats = getConversationStats(paneData.chatMessages.allMessages);
+                    if (paneData?.permissionRequests) {
+                        paneData.permissionRequests = paneData.permissionRequests.filter((r: any) => r.streamId !== completedStreamId);
+                    }
                     // If this pane was closed while streaming and never reopened, clean up
                     // its ghost data now that the stream is done and saved.
                     if (paneData?._closedWithActiveStream) {
@@ -1365,6 +1395,7 @@ export const usePaneAwareStreamListeners = (
             }
 
             if (targetPaneId) notifyPaneUpdate(targetPaneId);
+            if (targetPaneId) (window as any).__incognideQueueDrain?.(targetPaneId);
             await refreshConversations();
         };
 
@@ -1397,6 +1428,9 @@ export const usePaneAwareStreamListeners = (
                         }
                     }
                 }
+                if (paneData?.permissionRequests) {
+                    paneData.permissionRequests = paneData.permissionRequests.filter((r: any) => r.streamId !== errorStreamId);
+                }
                 if (paneData?._closedWithActiveStream) {
                     delete contentDataRef.current[targetPaneId];
                 }
@@ -1407,6 +1441,7 @@ export const usePaneAwareStreamListeners = (
                 setIsStreaming(false);
             }
             if (targetPaneId) notifyPaneUpdate(targetPaneId);
+            if (targetPaneId) (window as any).__incognideQueueDrain?.(targetPaneId);
         };
 
         const cleanupStreamData = window.api.onStreamData(handleStreamData);
@@ -1432,10 +1467,27 @@ export const usePaneAwareStreamListeners = (
                 const msgTime = msg.lastStreamAt || new Date(msg.timestamp).getTime();
                 const elapsed = Date.now() - msgTime;
 
-                if (elapsed > 300000 && msg.content && msg.content.length > 0 && msg.executionMode !== 'tool_agent') {
+                if (elapsed > 300000) {
                     console.warn(`[STREAM] Stale stream detected: ${streamId} (${Math.round(elapsed/1000)}s). Marking as complete.`);
                     msg.isStreaming = false;
                     msg.streamId = null;
+                    if (Array.isArray(msg.toolCalls)) {
+                        for (const tc of msg.toolCalls) {
+                            if (tc.status !== 'complete' && tc.status !== 'error') {
+                                tc.status = 'error';
+                                tc.result_preview = tc.result_preview || 'Stream went stale before tool reported a result';
+                            }
+                        }
+                    }
+                    if (Array.isArray(msg.contentParts)) {
+                        for (const part of msg.contentParts) {
+                            if (part.type === 'tool_call' && part.call?.status !== 'complete' && part.call?.status !== 'error') {
+                                part.call.status = 'error';
+                                part.call.result_preview = part.call.result_preview || 'Stream went stale before tool reported a result';
+                            }
+                        }
+                    }
+                    saveAssistantMessage(paneData, msg);
                     delete streamToPaneRef.current[streamId];
                     if (Object.keys(streamToPaneRef.current).length === 0) {
                         setIsStreaming(false);
@@ -1473,32 +1525,109 @@ export const useTrackLastActiveChatPane = (
     }, [activeContentPaneId, contentDataRef, setLastActiveChatPaneId]);
 };
 
+// Flip every unresolved tool call on a message to a terminal 'error' state.
+// Used when a stream ends without the tool reporting a result (interrupt/abort).
+export const markToolCallsInterrupted = (msg: any, reason: string) => {
+    if (Array.isArray(msg.toolCalls)) {
+        for (const tc of msg.toolCalls) {
+            if (tc.status !== 'complete' && tc.status !== 'error') {
+                tc.status = 'error';
+                tc.result_preview = tc.result_preview || reason;
+            }
+        }
+    }
+    if (Array.isArray(msg.contentParts)) {
+        for (const part of msg.contentParts) {
+            if (part.type === 'tool_call' && part.call?.status !== 'complete' && part.call?.status !== 'error') {
+                part.call.status = 'error';
+                part.call.result_preview = part.call.result_preview || reason;
+            }
+        }
+    }
+};
+
 export const handleInterruptStream = async (
-    activeContentPaneId: string | null,
+    targetPaneId: string | null,
     contentDataRef: React.MutableRefObject<any>,
-    isStreaming: boolean,
     streamToPaneRef: React.MutableRefObject<Record<string, string>>,
     setIsStreaming: (streaming: boolean) => void,
-    setRootLayoutNode: (fn: (prev: any) => any) => void
+    notifyPaneUpdate: (paneId: string) => void,
+    currentPath?: string
 ) => {
-    const activePaneData = contentDataRef.current[activeContentPaneId || ''];
-    if (!activePaneData || !activePaneData.chatMessages) {
-        console.warn("Interrupt clicked but no active chat pane found.");
+    const paneData = contentDataRef.current[targetPaneId || ''];
+    const clearPaneStreamingState = () => {
+        if (!paneData?.chatMessages?.allMessages) return;
+        for (const msg of paneData.chatMessages.allMessages) {
+            if (msg.isStreaming) {
+                msg.isStreaming = false;
+                msg.streamId = null;
+            }
+        }
+    };
+
+    const clearPermissionRequests = (streamId?: string) => {
+        if (!paneData?.permissionRequests) return;
+        if (streamId) {
+            paneData.permissionRequests = paneData.permissionRequests.filter((r: any) => r.streamId !== streamId);
+        } else {
+            paneData.permissionRequests = [];
+        }
+    };
+
+    if (!paneData || !paneData.chatMessages) {
+        console.warn("Interrupt clicked but no chat pane found for", targetPaneId);
+
+        // Fallback: interrupt the stream belonging to this pane (not an arbitrary one).
+        const fallbackEntry = Object.entries(streamToPaneRef.current)
+            .find(([, paneId]) => paneId === targetPaneId);
+        const fallbackStreamId = fallbackEntry?.[0]
+            ?? (Object.keys(streamToPaneRef.current).length === 1
+                ? Object.keys(streamToPaneRef.current)[0]
+                : undefined);
+        if (fallbackStreamId) {
+            try {
+                await window.api.interruptStream(fallbackStreamId);
+                console.log(`Fallback interrupt sent for stream: ${fallbackStreamId}`);
+            } catch (error) {
+                console.error(`Fallback interrupt failed for stream ${fallbackStreamId}:`, error);
+            }
+            delete streamToPaneRef.current[fallbackStreamId];
+            if (Object.keys(streamToPaneRef.current).length === 0) {
+                setIsStreaming(false);
+            }
+        }
+        clearPermissionRequests(fallbackStreamId);
+        clearPaneStreamingState();
+        if (targetPaneId) notifyPaneUpdate(targetPaneId);
         return;
     }
 
-    const streamingMessage = activePaneData.chatMessages.allMessages.find((m: any) => m.isStreaming);
+    const streamingMessage = paneData.chatMessages.allMessages.find((m: any) => m.isStreaming);
     if (!streamingMessage || !streamingMessage.streamId) {
-        console.warn("Interrupt clicked, but no streaming message found in the active pane.");
+        console.warn("Interrupt clicked, but no streaming message found in the target pane.");
 
-        if (isStreaming) {
-            const anyStreamId = Object.keys(streamToPaneRef.current)[0];
-            if (anyStreamId) {
+        const paneStreams = Object.entries(streamToPaneRef.current)
+            .filter(([, paneId]) => paneId === targetPaneId)
+            .map(([streamId]) => streamId);
+        const anyStreamId = paneStreams[0]
+            ?? (Object.keys(streamToPaneRef.current).length === 1
+                ? Object.keys(streamToPaneRef.current)[0]
+                : undefined);
+        if (anyStreamId) {
+            try {
                 await window.api.interruptStream(anyStreamId);
                 console.log(`Fallback interrupt sent for stream: ${anyStreamId}`);
+            } catch (error) {
+                console.error(`Fallback interrupt failed for stream ${anyStreamId}:`, error);
             }
+            delete streamToPaneRef.current[anyStreamId];
+        }
+        if (Object.keys(streamToPaneRef.current).length === 0) {
             setIsStreaming(false);
         }
+        clearPermissionRequests(anyStreamId);
+        clearPaneStreamingState();
+        if (targetPaneId) notifyPaneUpdate(targetPaneId);
         return;
     }
 
@@ -1508,13 +1637,35 @@ export const handleInterruptStream = async (
     streamingMessage.content = (streamingMessage.content || '') + `\n\n[Stream Interrupted by User]`;
     streamingMessage.isStreaming = false;
     streamingMessage.streamId = null;
+    markToolCallsInterrupted(streamingMessage, 'Interrupted by user');
+
+    // Persist the interrupted state so it survives pane reloads.
+    (window as any).api.saveMessage({
+        message_id: streamingMessage.id,
+        timestamp: streamingMessage.timestamp || new Date().toISOString(),
+        role: 'assistant',
+        content: streamingMessage.content,
+        conversation_id: paneData.contentId,
+        directory_path: currentPath,
+        model: streamingMessage.model,
+        provider: streamingMessage.provider,
+        npc: streamingMessage.npc,
+        execution_mode: paneData.executionMode,
+        input_tokens: streamingMessage.input_tokens,
+        output_tokens: streamingMessage.output_tokens,
+        cost: streamingMessage.cost,
+        reasoning_content: streamingMessage.reasoningContent || null,
+        tool_calls: streamingMessage.toolCalls || null,
+    }).catch((err: any) => console.error('[INTERRUPT] Failed to save interrupted message:', err));
 
     delete streamToPaneRef.current[streamIdToInterrupt];
     if (Object.keys(streamToPaneRef.current).length === 0) {
         setIsStreaming(false);
     }
 
-    setRootLayoutNode(prev => ({ ...prev }));
+    clearPermissionRequests(streamIdToInterrupt);
+    clearPaneStreamingState();
+    if (targetPaneId) notifyPaneUpdate(targetPaneId);
 
     try {
         await window.api.interruptStream(streamIdToInterrupt);
@@ -1522,8 +1673,10 @@ export const handleInterruptStream = async (
     } catch (error) {
         console.error(`[REACT] handleInterruptStream: API call to interrupt stream ${streamIdToInterrupt} failed:`, error);
         streamingMessage.content += " [Interruption API call failed]";
-        setRootLayoutNode(prev => ({ ...prev }));
+        if (targetPaneId) notifyPaneUpdate(targetPaneId);
     }
+    clearPaneStreamingState();
+    if (targetPaneId) notifyPaneUpdate(targetPaneId);
 };
 
 export const handleRenameFile = async (
@@ -1576,16 +1729,6 @@ export const getThumbnailIcon = (fileName: string, fileType?: string) => {
         case 'json': return <FileJson {...iconProps} className="text-orange-400" />;
         default: return <File {...iconProps} className="text-gray-400" />;
     }
-};
-
-export const createToggleMessageSelectionMode = (
-    setMessageSelectionMode: (fn: (prev: boolean) => boolean) => void,
-    setSelectedMessages: (set: Set<any>) => void
-) => {
-    return () => {
-        setMessageSelectionMode(prev => !prev);
-        setSelectedMessages(new Set());
-    };
 };
 
 export const findNodeByPath = (node: any, path: number[]): any => {

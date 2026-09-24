@@ -8,8 +8,47 @@ const { spawn } = require('child_process');
 const crypto = require('crypto');
 const sqlite3 = require('sqlite3');
 const yaml = require('js-yaml');
+const orcarouterIpc = require('./orcarouter');
+const { PROVIDER_ID: ORCAROUTER_PROVIDER, describe: describeOrcaRouter } = require('../services/orcarouter/provider');
+const { CAPABILITY: ORCA_CAPABILITY, resolveCatalog: orcarouterCatalogResolve } = require('../services/orcarouter/catalog');
+const { looksLikeOrcaKey, SOURCE_API_KEY: ORCA_SOURCE_API_KEY } = require('../services/orcarouter/credentials');
 
 const dbPath = process.env.INCOGNIDE_DB_PATH || path.join(os.homedir(), '.incognide', 'history.db');
+
+let sharedDb = null;
+function getSharedDb() {
+    if (!sharedDb) {
+        sharedDb = new sqlite3.Database(dbPath);
+        sharedDb.run('PRAGMA busy_timeout = 5000');
+        sharedDb.run('PRAGMA journal_mode = WAL');
+    }
+    return sharedDb;
+}
+function closeSharedDb() {
+    if (sharedDb) {
+        sharedDb.close();
+        sharedDb = null;
+    }
+}
+
+function withRetry(operation, maxRetries = 5, delayMs = 50) {
+    return new Promise((resolve, reject) => {
+        const attempt = (retriesLeft) => {
+            operation()
+                .then(resolve)
+                .catch((err) => {
+                    const isBusy = err && (err.message?.includes('SQLITE_BUSY') || err.message?.includes('database is locked') || err.code === 'SQLITE_BUSY');
+                    if (isBusy && retriesLeft > 0) {
+                        setTimeout(() => attempt(retriesLeft - 1), delayMs);
+                        delayMs *= 2;
+                    } else {
+                        reject(err);
+                    }
+                });
+        };
+        attempt(maxRetries);
+    });
+}
 
 const expandTilde = (filepath) => {
   if (typeof filepath !== 'string') return filepath;
@@ -164,6 +203,27 @@ function parseIncogniderc() {
   return result;
 }
 
+async function resolveOrcaCredential() {
+  const store = orcarouterIpc.getCredentialStore();
+  const stored = store ? await store.read() : null;
+  if (stored && stored.key) return stored;
+
+  let key = process.env.ORCAROUTER_API_KEY;
+  if (!key) {
+    const rc = parseIncogniderc();
+    key = rc.ORCAROUTER_API_KEY;
+  }
+  if (key && looksLikeOrcaKey(key)) {
+    return {
+      key,
+      source: ORCA_SOURCE_API_KEY,
+      needsReauth: false,
+      generation: 1,
+    };
+  }
+  return null;
+}
+
 function getBackendPythonPath() {
   const rcPath = path.join(os.homedir(), '.incogniderc');
   try {
@@ -208,6 +268,35 @@ function register(ctx) {
   const activeConversations = new Map();
   const STREAM_DISCONNECT_TTL_MS = 10 * 60 * 1000; // orphan a disconnected stream's tail after 10 min
   const STREAM_BUFFER_CAP = 20000; // cap buffered chunks while no live sender is attached
+
+  const senderReloadCleanups = new WeakMap();
+
+  function cleanupStreamsForSender(sender) {
+    for (const [streamId, entry] of activeStreams.entries()) {
+      const entrySender = entry.sender || entry.eventSender;
+      if (entrySender !== sender) continue;
+      try {
+        if (entry.stream && typeof entry.stream.destroy === 'function') {
+          entry.stream.destroy();
+        }
+      } catch {}
+      activeStreams.delete(streamId);
+      if (entry.conversationId) activeConversations.delete(entry.conversationId);
+      log(`[Main Process] Cleaned up stream ${streamId} because renderer reloaded or was destroyed.`);
+    }
+  }
+
+  function ensureSenderCleanup(sender) {
+    if (!sender) return;
+    if (senderReloadCleanups.has(sender)) {
+      sender.removeListener('did-start-loading', senderReloadCleanups.get(sender));
+      sender.removeListener('destroyed', senderReloadCleanups.get(sender));
+    }
+    const cleanup = () => cleanupStreamsForSender(sender);
+    senderReloadCleanups.set(sender, cleanup);
+    sender.on('did-start-loading', cleanup);
+    sender.on('destroyed', cleanup);
+  }
 
   // Reclaim orphaned streams: ones whose renderer died and were never re-attached.
   // Pre-disconnect content is already in the DB; the post-disconnect tail is lost here.
@@ -439,8 +528,42 @@ function register(ctx) {
     return registeredTeams;
   }
 
-  ipcMain.handle('get-provider-models', async (event, { provider, baseUrl, apiKeyVar }) => {
+  ipcMain.handle('get-provider-models', async (event, { provider, baseUrl, apiKeyVar, capability, inputModalities }) => {
     const normalizedProvider = (provider || '').toLowerCase();
+
+    // OrcaRouter is a first-class named provider: its catalog is discovered
+    // through the shared catalog service, with the capability filter applied
+    // here in the main process rather than in any renderer.
+    if (normalizedProvider === ORCAROUTER_PROVIDER) {
+      const record = await resolveOrcaCredential();
+      const apiKey = record && !record.needsReauth ? record.key : null;
+      const { apiBase } = describeOrcaRouter(process.env);
+
+      const resolved = await orcarouterCatalogResolve({
+        apiBase,
+        apiKey,
+        capability: capability || ORCA_CAPABILITY.CHAT,
+        inputModalities: Array.isArray(inputModalities) ? inputModalities : null,
+      });
+
+      return {
+        models: resolved.models.map((m) => ({
+          id: m.id,
+          value: m.id,
+          name: m.name || m.id,
+          display_name: m.name || m.id,
+          provider: ORCAROUTER_PROVIDER,
+          context_length: m.context_length,
+          architecture: m.architecture,
+          supported_endpoint_types: m.supported_endpoint_types,
+          reasoning: m.reasoning,
+          reasoning_efforts: m.reasoning_efforts,
+        })),
+        source: resolved.source,
+        degraded: resolved.degraded,
+        error: resolved.error ? resolved.message || resolved.error : null,
+      };
+    }
 
     // Try the provider's own OpenAI-compatible /models endpoint first.
     const direct = await fetchProviderModels({ provider, baseUrl, apiKeyVar });
@@ -603,46 +726,47 @@ function register(ctx) {
   });
 
   ipcMain.handle('saveMessage', async (_, message) => {
-    try {
-      const db = new sqlite3.Database(dbPath);
-      const query = `
-        INSERT OR REPLACE INTO conversation_history
-        (message_id, timestamp, role, content, conversation_id, directory_path,
-         model, provider, npc, team, reasoning_content, tool_calls, tool_results,
-         parent_message_id, params, input_tokens, output_tokens, cost, execution_mode,
-         device_id, device_name)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `;
-      const params = [
-        message.message_id,
-        message.timestamp,
-        message.role,
-        message.content,
-        message.conversation_id,
-        message.directory_path,
-        message.model || null,
-        message.provider || null,
-        message.npc || null,
-        message.team || null,
-        message.reasoning_content || null,
-        message.tool_calls ? JSON.stringify(message.tool_calls) : null,
-        message.tool_results ? JSON.stringify(message.tool_results) : null,
-        message.parent_message_id || null,
-        message.params ? JSON.stringify(message.params) : null,
-        message.input_tokens || null,
-        message.output_tokens || null,
-        message.cost || null,
-        message.execution_mode,
-        message.device_id || null,
-        message.device_name || null,
-      ];
-      await new Promise((resolve, reject) => {
-        db.run(query, params, function(err) {
-          db.close();
-          if (err) reject(err);
-          else resolve({ lastID: this.lastID, changes: this.changes });
-        });
+    const query = `
+      INSERT OR REPLACE INTO conversation_history
+      (message_id, parent_message_id, branch_id, timestamp, role, content, conversation_id, directory_path,
+       model, provider, npc, team, reasoning_content, tool_calls, tool_results,
+       params, input_tokens, output_tokens, cost, execution_mode,
+       device_id, device_name)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `;
+    const params = [
+      message.message_id,
+      message.parent_message_id || null,
+      message.branch_id || null,
+      message.timestamp,
+      message.role,
+      message.content,
+      message.conversation_id,
+      message.directory_path,
+      message.model || null,
+      message.provider || null,
+      message.npc || null,
+      message.team || null,
+      message.reasoning_content || null,
+      message.tool_calls ? JSON.stringify(message.tool_calls) : null,
+      message.tool_results ? JSON.stringify(message.tool_results) : null,
+      message.params ? JSON.stringify(message.params) : null,
+      message.input_tokens || null,
+      message.output_tokens || null,
+      message.cost || null,
+      message.execution_mode,
+      message.device_id || null,
+      message.device_name || null,
+    ];
+    const operation = () => new Promise((resolve, reject) => {
+      const db = getSharedDb();
+      db.run(query, params, function(err) {
+        if (err) reject(err);
+        else resolve({ lastID: this.lastID, changes: this.changes });
       });
+    });
+    try {
+      await withRetry(operation, 5, 50);
       return { success: true };
     } catch (err) {
       console.error('[saveMessage] Error saving message:', err);
@@ -670,9 +794,12 @@ function register(ctx) {
     }
   });
 
+  const streamAbortControllers = new Map();
+
   ipcMain.handle('interruptStream', async (event, streamIdToInterrupt) => {
     log(`[Main Process] Received request to interrupt stream: ${streamIdToInterrupt}`);
 
+    let backendAck = false;
     try {
       const response = await fetch(`${BACKEND_URL}/api/interrupt`, {
         method: 'POST',
@@ -684,25 +811,55 @@ function register(ctx) {
 
       if (!response.ok) {
         const errorText = await response.text();
-        throw new Error(`Backend failed to acknowledge interruption: ${errorText}`);
+        log(`[Main Process] Backend failed to acknowledge interruption: ${errorText}`);
+      } else {
+        const result = await response.json();
+        log(`[Main Process] Backend response to interruption:`, result.message);
+        backendAck = true;
       }
-
-      const result = await response.json();
-      log(`[Main Process] Backend response to interruption:`, result.message);
-
+    } catch (error) {
+      console.error('[Main Process] Error sending interrupt request to backend:', error);
+    } finally {
+      const controller = streamAbortControllers.get(streamIdToInterrupt);
+      if (controller) {
+        try { controller.abort(); } catch {}
+        streamAbortControllers.delete(streamIdToInterrupt);
+      }
       if (activeStreams.has(streamIdToInterrupt)) {
           const entry = activeStreams.get(streamIdToInterrupt);
           if (entry && entry.stream && typeof entry.stream.destroy === 'function') {
-              entry.stream.destroy();
+              try { entry.stream.destroy(); } catch (e) {}
+          }
+          if (entry && entry.sender && !entry.sender.isDestroyed()) {
+              try {
+                  entry.sender.send('stream-complete', { streamId: streamIdToInterrupt });
+              } catch (e) {}
           }
           if (entry && entry.conversationId) activeConversations.delete(entry.conversationId);
           activeStreams.delete(streamIdToInterrupt);
       }
+    }
 
+    return { success: true, backendAck };
+  });
+
+  ipcMain.handle('permission:respond', async (event, { request_id, decision }) => {
+    log(`[Main Process] Permission decision for ${request_id}: ${decision}`);
+    try {
+      const response = await fetch(`${BACKEND_URL}/api/permission_response`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ request_id, decision }),
+      });
+      if (!response.ok) {
+        const errorText = await response.text();
+        return { success: false, error: errorText };
+      }
       return { success: true };
-
     } catch (error) {
-      console.error('[Main Process] Error sending interrupt request to backend:', error);
+      console.error('[Main Process] Error sending permission decision:', error);
       return { success: false, error: error.message };
     }
   });
@@ -751,7 +908,6 @@ function register(ctx) {
   });
 
   ipcMain.handle('executeCommandStream', async (event, data) => {
-
     const currentStreamId = data.streamId || generateId();
     log(`[Main Process] executeCommandStream: Starting stream with ID: ${currentStreamId}`);
 
@@ -778,6 +934,42 @@ function register(ctx) {
         }
       }
 
+      // OrcaRouter is a first-class provider, resolved from the single
+      // credential seam rather than from a custom-provider entry. Both the
+      // pasted-key adapter and the PKCE adapter land in the same store, so this
+      // path does not care which one was used.
+      if ((provider || '').toLowerCase() === ORCAROUTER_PROVIDER) {
+        const record = await resolveOrcaCredential();
+
+        if (!record || !record.key) {
+          // Not signed in: return the actionable message instead of issuing an
+          // unauthenticated request that would surface a bare 401 downstream.
+          event.sender.send('stream-error', {
+            streamId: currentStreamId,
+            error: 'OrcaRouter is not connected. Add an API key or sign in with OrcaRouter.',
+          });
+          return { error: 'OrcaRouter is not connected.', streamId: currentStreamId };
+        }
+
+        if (record.needsReauth) {
+          event.sender.send('stream-error', {
+            streamId: currentStreamId,
+            error: 'Your OrcaRouter credential was revoked or rejected. Reconnect to continue.',
+          });
+          return { error: 'OrcaRouter credential requires reauthentication.', streamId: currentStreamId };
+        }
+
+        apiKeyOverride = record.key;
+        apiUrlOverride = describeOrcaRouter(process.env).apiBase;
+        // OrcaRouter keeps the vendor/model namespace verbatim; only the
+        // `orcarouter/` provider prefix added by the selector is removed.
+        const orcaPrefix = `${data.provider}/`;
+        if (model && model.startsWith(orcaPrefix)) {
+          model = model.slice(orcaPrefix.length);
+        }
+        log(`[Main Process] OrcaRouter resolved to ${apiUrlOverride} (credential source: ${record.source})`);
+      }
+
       // Load registered teams from frontend config to pass to backend
       let registeredTeams = [];
       try {
@@ -796,7 +988,8 @@ function register(ctx) {
           const msgRows = await new Promise((resolve, reject) => {
             const db = new sqlite3.Database(dbPath);
             const query = `
-              SELECT role, content, timestamp, tool_calls, tool_results
+              SELECT message_id, role, content, timestamp, tool_calls, tool_results,
+                     model, provider, npc, input_tokens, output_tokens, cost, execution_mode
               FROM conversation_history
               WHERE conversation_id = ?
               ORDER BY timestamp ASC, id ASC
@@ -810,9 +1003,17 @@ function register(ctx) {
 
           conversationMessages = msgRows.map(row => {
             const msg = {
+              id: row.message_id,
               role: row.role,
               content: row.content,
               timestamp: row.timestamp,
+              model: row.model,
+              provider: row.provider,
+              npc: row.npc,
+              input_tokens: row.input_tokens,
+              output_tokens: row.output_tokens,
+              cost: row.cost ? parseFloat(row.cost) : 0,
+              executionMode: row.execution_mode,
             };
 
             if (row.role === 'tool' && row.content) {
@@ -865,7 +1066,6 @@ function register(ctx) {
         npcSource: data.npcSource || 'global',
         attachments: data.attachments || [],
         executionMode: data.executionMode || 'chat',
-        parentMessageId: data.parentMessageId,
         isResend: data.isRerun || false,
         jinxes: data.jinxes || [],
         tools: data.tools || [],
@@ -875,8 +1075,6 @@ function register(ctx) {
 
         userMessageId: data.userMessageId,
         assistantMessageId: data.assistantMessageId,
-
-        userParentMessageId: data.userParentMessageId,
 
         temperature: data.temperature,
         top_p: data.top_p,
@@ -903,142 +1101,152 @@ function register(ctx) {
         payload.api_key = apiKeyOverride;
       }
 
-      const response = await fetch(`${BACKEND_URL}/api/stream`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-
-      log(`[Main Process] Backend response status for streamId ${currentStreamId}: ${response.status}`);
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`HTTP error! Status: ${response.status}. Body: ${errorText}`);
-      }
-
-      const stream = response.body;
-      if (!stream) {
-        event.sender.send('stream-error', { streamId: currentStreamId, error: 'Backend returned no stream data.' });
-        return { error: 'Backend returned no stream data.', streamId: currentStreamId };
-      }
-
-      activeStreams.set(currentStreamId, {
-        stream,
-        sender: event.sender,
-        conversationId: data.conversationId || null,
-        assistantMessageId: data.assistantMessageId || null,
-        buffer: [],
-        pendingCompletion: null,
-        disconnectedAt: null,
-      });
-      if (data.conversationId) activeConversations.set(data.conversationId, currentStreamId);
-
-      (function(capturedStreamId) {
-        const removeEntry = () => {
-          const e = activeStreams.get(capturedStreamId);
-          if (e && e.conversationId) activeConversations.delete(e.conversationId);
-          activeStreams.delete(capturedStreamId);
-        };
-
-        const liveSender = () => {
-          const e = activeStreams.get(capturedStreamId);
-          return e && e.sender && !e.sender.isDestroyed() ? e.sender : null;
-        };
-
-        stream.on('data', (chunk) => {
-          const e = activeStreams.get(capturedStreamId);
-          if (!e) return;
-          const sender = e.sender && !e.sender.isDestroyed() ? e.sender : null;
-          if (!sender) {
-            // Renderer gone (reload / pane closed) but backend still generating.
-            // Buffer for re-attach instead of killing the backend pipe.
-            if (!e.disconnectedAt) e.disconnectedAt = Date.now();
-            e.buffer.push(chunk.toString());
-            if (e.buffer.length > STREAM_BUFFER_CAP) {
-              e.buffer.shift();
-              log(`[Main Process] Stream ${capturedStreamId} buffer capped at ${STREAM_BUFFER_CAP} (overflow dropping oldest).`);
-            }
-            return;
-          }
-          e.disconnectedAt = null;
-          sender.send('stream-data', {
-            streamId: capturedStreamId,
-            chunk: chunk.toString()
-          });
+      const controller = new AbortController();
+      streamAbortControllers.set(currentStreamId, controller);
+      try {
+        const response = await fetch(`${BACKEND_URL}/api/stream`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          signal: controller.signal,
         });
 
-        let streamCompleteSent = false;
-        const sendStreamComplete = () => {
-          if (streamCompleteSent) return;
-          streamCompleteSent = true;
-          const sender = liveSender();
-          if (sender) {
-            sender.send('stream-complete', { streamId: capturedStreamId });
-            removeEntry();
-          } else {
-            // No live renderer: keep the entry so a later re-attach can deliver completion.
+        log(`[Main Process] Backend response status for streamId ${currentStreamId}: ${response.status}`);
+        if (!response.ok) {
+          const errorText = await response.text();
+          throw new Error(`HTTP error! Status: ${response.status}. Body: ${errorText}`);
+        }
+
+        const stream = response.body;
+        if (!stream) {
+          streamAbortControllers.delete(currentStreamId);
+          event.sender.send('stream-error', { streamId: currentStreamId, error: 'Backend returned no stream data.' });
+          return { error: 'Backend returned no stream data.', streamId: currentStreamId };
+        }
+
+        activeStreams.set(currentStreamId, {
+          stream,
+          sender: event.sender,
+          conversationId: data.conversationId || null,
+          assistantMessageId: data.assistantMessageId || null,
+          buffer: [],
+          pendingCompletion: null,
+          disconnectedAt: null,
+        });
+        ensureSenderCleanup(event.sender);
+        if (data.conversationId) activeConversations.set(data.conversationId, currentStreamId);
+
+        (function(capturedStreamId) {
+          const removeEntry = () => {
             const e = activeStreams.get(capturedStreamId);
-            if (e) e.pendingCompletion = { type: 'complete' };
-            log(`[Main Process] Stream ${capturedStreamId} ended while renderer disconnected; holding for re-attach.`);
-          }
-        };
+            if (e && e.conversationId) activeConversations.delete(e.conversationId);
+            activeStreams.delete(capturedStreamId);
+            streamAbortControllers.delete(capturedStreamId);
+          };
 
-        stream.on('end', () => {
-          log(`[Main Process] Stream ${capturedStreamId} ended from backend.`);
-          sendStreamComplete();
-        });
+          const liveSender = () => {
+            const e = activeStreams.get(capturedStreamId);
+            return e && e.sender && !e.sender.isDestroyed() ? e.sender : null;
+          };
 
-        stream.on('close', () => {
-          if (activeStreams.has(capturedStreamId)) {
-            log(`[Main Process] Stream ${capturedStreamId} closed without end.`);
-            sendStreamComplete();
-          }
-        });
-
-        stream.on('error', (err) => {
-          log(`[Main Process] Stream ${capturedStreamId} error:`, err.message);
-          const sender = liveSender();
-          if (sender) {
-            const categorized = categorizeBackendError(err);
-            sender.send('stream-error', {
+          stream.on('data', (chunk) => {
+            const e = activeStreams.get(capturedStreamId);
+            if (!e) return;
+            const sender = e.sender && !e.sender.isDestroyed() ? e.sender : null;
+            if (!sender) {
+              // Renderer gone (reload / pane closed) but backend still generating.
+              // Buffer for re-attach instead of killing the backend pipe.
+              if (!e.disconnectedAt) e.disconnectedAt = Date.now();
+              e.buffer.push(chunk.toString());
+              if (e.buffer.length > STREAM_BUFFER_CAP) {
+                e.buffer.shift();
+                log(`[Main Process] Stream ${capturedStreamId} buffer capped at ${STREAM_BUFFER_CAP} (overflow dropping oldest).`);
+              }
+              return;
+            }
+            e.disconnectedAt = null;
+            sender.send('stream-data', {
               streamId: capturedStreamId,
+              chunk: chunk.toString()
+            });
+          });
+
+          let streamCompleteSent = false;
+          const sendStreamComplete = () => {
+            if (streamCompleteSent) return;
+            streamCompleteSent = true;
+            const sender = liveSender();
+            if (sender) {
+              sender.send('stream-complete', { streamId: capturedStreamId });
+              removeEntry();
+            } else {
+              // No live renderer: keep the entry so a later re-attach can deliver completion.
+              const e = activeStreams.get(capturedStreamId);
+              if (e) e.pendingCompletion = { type: 'complete' };
+              log(`[Main Process] Stream ${capturedStreamId} ended while renderer disconnected; holding for re-attach.`);
+            }
+          };
+
+          stream.on('end', () => {
+            log(`[Main Process] Stream ${capturedStreamId} ended from backend.`);
+            sendStreamComplete();
+          });
+
+          stream.on('close', () => {
+            if (activeStreams.has(capturedStreamId)) {
+              log(`[Main Process] Stream ${capturedStreamId} closed without end.`);
+              sendStreamComplete();
+            }
+          });
+
+          stream.on('error', (err) => {
+            log(`[Main Process] Stream ${capturedStreamId} error:`, err.message);
+            const sender = liveSender();
+            if (sender) {
+              const categorized = categorizeBackendError(err);
+              sender.send('stream-error', {
+                streamId: capturedStreamId,
+                error: categorized.userMessage,
+                category: categorized.category,
+                suggestion: categorized.suggestion,
+                original: categorized.original,
+              });
+              removeEntry();
+            } else {
+              const e = activeStreams.get(capturedStreamId);
+              if (e) {
+                const categorized = categorizeBackendError(err);
+                e.pendingCompletion = {
+                  type: 'error',
+                  error: categorized.userMessage,
+                  category: categorized.category,
+                  suggestion: categorized.suggestion,
+                  original: categorized.original,
+                };
+              }
+              log(`[Main Process] Stream ${capturedStreamId} errored while renderer disconnected; holding for re-attach.`);
+            }
+          });
+        })(currentStreamId);
+
+        return { streamId: currentStreamId };
+      } catch (err) {
+        log(`[Main Process] Error setting up stream ${currentStreamId}:`, err.message);
+        streamAbortControllers.delete(currentStreamId);
+        const categorized = categorizeBackendError(err);
+        if (event.sender && !event.sender.isDestroyed()) {
+            event.sender.send('stream-error', {
+              streamId: currentStreamId,
               error: categorized.userMessage,
               category: categorized.category,
               suggestion: categorized.suggestion,
               original: categorized.original,
             });
-            removeEntry();
-          } else {
-            const e = activeStreams.get(capturedStreamId);
-            if (e) {
-              const categorized = categorizeBackendError(err);
-              e.pendingCompletion = {
-                type: 'error',
-                error: categorized.userMessage,
-                category: categorized.category,
-                suggestion: categorized.suggestion,
-                original: categorized.original,
-              };
-            }
-            log(`[Main Process] Stream ${capturedStreamId} errored while renderer disconnected; holding for re-attach.`);
-          }
-        });
-      })(currentStreamId);
-
-      return { streamId: currentStreamId };
-
-    } catch (err) {
-      log(`[Main Process] Error setting up stream ${currentStreamId}:`, err.message);
-      const categorized = categorizeBackendError(err);
-      if (event.sender && !event.sender.isDestroyed()) {
-          event.sender.send('stream-error', {
-            streamId: currentStreamId,
-            error: categorized.userMessage,
-            category: categorized.category,
-            suggestion: categorized.suggestion,
-            original: categorized.original,
-          });
+        }
+        return { error: categorized.userMessage, streamId: currentStreamId };
       }
-      return { error: categorized.userMessage, streamId: currentStreamId };
+    } catch (outerErr) {
+      log(`[Main Process] Unhandled stream setup error:`, outerErr.message);
     }
   });
 
@@ -1137,6 +1345,7 @@ function register(ctx) {
         }
 
         activeStreams.set(currentStreamId, { stream, eventSender: event.sender });
+        ensureSenderCleanup(event.sender);
 
         stream.on('data', (chunk) => {
             if (event.sender.isDestroyed()) {
@@ -1318,7 +1527,8 @@ function register(ctx) {
             (SELECT npc FROM conversation_history AS c2 WHERE c2.conversation_id = conversation_history.conversation_id AND c2.npc IS NOT NULL AND c2.npc != '' ORDER BY timestamp DESC, id DESC LIMIT 1) as npc,
             (SELECT model FROM conversation_history AS c2 WHERE c2.conversation_id = conversation_history.conversation_id AND c2.model IS NOT NULL AND c2.model != '' ORDER BY timestamp DESC, id DESC LIMIT 1) as model,
             (SELECT provider FROM conversation_history AS c2 WHERE c2.conversation_id = conversation_history.conversation_id AND c2.provider IS NOT NULL AND c2.provider != '' ORDER BY timestamp DESC, id DESC LIMIT 1) as provider,
-            MAX(execution_mode) as execution_mode
+            MAX(execution_mode) as execution_mode,
+            MAX(CASE WHEN tool_calls IS NOT NULL AND tool_calls != '' AND tool_calls != '[]' THEN 1 ELSE 0 END) as has_tool_calls
           FROM conversation_history
           WHERE REPLACE(RTRIM(directory_path, '/\\'), '\\', '/') = ?
           GROUP BY conversation_id
@@ -1339,7 +1549,7 @@ function register(ctx) {
         npcs: (row.npcs || '').split(',').filter(Boolean),
         models: (row.models || '').split(',').filter(Boolean),
         providers: (row.providers || '').split(',').filter(Boolean),
-        execution_mode: row.execution_mode,
+        execution_mode: row.execution_mode || (row.has_tool_calls ? 'tool_agent' : 'chat'),
         npc: row.npc || (row.npcs || '').split(',')[0] || '',
         model: row.model || (row.models || '').split(',')[0] || '',
         provider: row.provider || (row.providers || '').split(',')[0] || '',
@@ -1409,7 +1619,6 @@ function register(ctx) {
             ch.reasoning_content,
             ch.tool_calls,
             ch.tool_results,
-            ch.parent_message_id,
             ch.input_tokens,
             ch.output_tokens,
             ch.cost,
@@ -1541,7 +1750,6 @@ function register(ctx) {
                 reasoningContent: row.reasoning_content,
                 toolCalls,
                 toolResults,
-                parentMessageId: row.parent_message_id,
                 input_tokens: row.input_tokens || 0,
                 output_tokens: row.output_tokens || 0,
                 cost: row.cost ? parseFloat(row.cost) : null,
@@ -1551,7 +1759,6 @@ function register(ctx) {
             delete newRow.reasoning_content;
             delete newRow.tool_calls;
             delete newRow.tool_results;
-            delete newRow.parent_message_id;
             return newRow;
         });
 
@@ -1677,6 +1884,7 @@ function register(ctx) {
       }
 
       activeStreams.set(currentStreamId, { stream, eventSender: event.sender });
+      ensureSenderCleanup(event.sender);
 
       (function(capturedStreamId) {
         let streamCompleteSent3 = false;

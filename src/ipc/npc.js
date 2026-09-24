@@ -23,6 +23,32 @@ function register(ctx) {
 
   const INCOGNIDE_HOME = ctxIncognideHome || path.join(os.homedir(), '.incognide');
   const INCOGNIDE_TEAM_PATH = path.join(INCOGNIDE_HOME, 'npc_team');
+  const senderReloadCleanups = new WeakMap();
+
+  function cleanupStreamsForSender(sender) {
+    for (const [streamId, entry] of activeStreams.entries()) {
+      if (entry.eventSender !== sender) continue;
+      try {
+        if (entry.stream && typeof entry.stream.destroy === 'function') {
+          entry.stream.destroy();
+        }
+      } catch {}
+      activeStreams.delete(streamId);
+      log(`[Main Process] Cleaned up NPC stream ${streamId} because renderer reloaded or was destroyed.`);
+    }
+  }
+
+  function ensureSenderCleanup(sender) {
+    if (!sender) return;
+    if (senderReloadCleanups.has(sender)) {
+      sender.removeListener('did-start-loading', senderReloadCleanups.get(sender));
+      sender.removeListener('destroyed', senderReloadCleanups.get(sender));
+    }
+    const cleanup = () => cleanupStreamsForSender(sender);
+    senderReloadCleanups.set(sender, cleanup);
+    sender.on('did-start-loading', cleanup);
+    sender.on('destroyed', cleanup);
+  }
 
   (async () => {
     const destBase = INCOGNIDE_TEAM_PATH;
@@ -203,6 +229,7 @@ function register(ctx) {
         }
 
         activeStreams.set(currentStreamId, { stream, eventSender: event.sender });
+        ensureSenderCleanup(event.sender);
 
         (function(capturedStreamId) {
             stream.on('data', (chunk) => {
@@ -615,13 +642,17 @@ function register(ctx) {
     }
   };
 
+  function preprocessJinja(content) {
+    return content.replace(/(?<!["'])\{\{[^{}]*\}\}(?!["'])/g, (match) => `"${match}"`);
+  }
+
   async function readTeamConfig(teamDir) {
     try {
       const files = await fsPromises.readdir(teamDir);
       const ctxFile = files.find(f => f.endsWith('.ctx'));
       if (!ctxFile) return null;
       const content = await fsPromises.readFile(path.join(teamDir, ctxFile), 'utf8');
-      return yaml.load(content) || null;
+      return yaml.load(preprocessJinja(content)) || null;
     } catch {
       return null;
     }
@@ -1426,6 +1457,34 @@ function register(ctx) {
       );
       return { success: true };
     } catch (err) { return { error: err.message }; }
+  });
+
+  ipcMain.handle('activity:log-batch', async (event, rows) => {
+    try {
+      const now = new Date().toISOString();
+      const placeholders = [];
+      const params = [];
+      for (const data of (rows || [])) {
+        placeholders.push('(?, ?, ?, ?, ?, ?, ?)');
+        params.push(
+          data.type || 'unknown',
+          JSON.stringify(data.data || {}),
+          data.directoryPath || null,
+          data.npc || null,
+          data.deviceId || null,
+          data.sessionId || null,
+          now
+        );
+      }
+      if (placeholders.length === 0) return { success: true, count: 0 };
+      await dbQuery(
+        `INSERT INTO activity_log (activity_type, activity_data, directory_path, npc, device_id, session_id, timestamp) VALUES ${placeholders.join(', ')}`,
+        params
+      );
+      return { success: true, count: rows.length };
+    } catch (err) {
+      return { error: err.message };
+    }
   });
 
   ipcMain.handle('activity:list', async (event, data = {}) => {

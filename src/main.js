@@ -1,4 +1,5 @@
 const { app, BrowserWindow, globalShortcut, ipcMain, protocol, shell, BrowserView, safeStorage, session, nativeImage, dialog, screen, Menu } = require('electron');
+const { setupWebContentsHandlers } = require('./ipc');
 const { desktopCapturer } = require('electron');
 const { spawn, execSync } = require('child_process');
 const path = require('path');
@@ -24,6 +25,22 @@ const daemons = new Map();
 
 const sqlite3 = require('sqlite3');
 const dbPath = process.env.INCOGNIDE_DB_PATH || path.join(os.homedir(), '.incognide', 'history.db');
+
+let sharedDb = null;
+function getSharedDb() {
+    if (!sharedDb) {
+        sharedDb = new sqlite3.Database(dbPath);
+        sharedDb.run('PRAGMA busy_timeout = 5000');
+        sharedDb.run('PRAGMA journal_mode = WAL');
+    }
+    return sharedDb;
+}
+function closeSharedDb() {
+    if (sharedDb) {
+        sharedDb.close();
+        sharedDb = null;
+    }
+}
 const fetch = require('node-fetch');
 const crypto = require('crypto');
 const http = require('http');
@@ -255,6 +272,52 @@ const electronLogStream = fs.createWriteStream(electronLogPath, { flags: 'a' });
 const backendLogStream = fs.createWriteStream(backendLogPath, { flags: 'a' });
 
 let mainWindow = null;
+
+ipcMain.on('window-minimize', () => {
+    mainWindow?.minimize();
+});
+ipcMain.on('window-maximize', () => {
+    if (!mainWindow) return;
+    if (mainWindow.isMaximized()) mainWindow.unmaximize();
+    else mainWindow.maximize();
+});
+ipcMain.on('window-close', () => {
+    mainWindow?.close();
+});
+ipcMain.handle('window-is-maximized', () => {
+    return mainWindow?.isMaximized() ?? false;
+});
+ipcMain.on('window-open-devtools', () => {
+    mainWindow?.webContents?.openDevTools();
+});
+ipcMain.on('window-toggle-devtools', () => {
+    mainWindow?.webContents?.toggleDevTools();
+});
+
+ipcMain.on('menu-action', (_, { action, url }) => {
+    if (!mainWindow) return;
+    switch (action) {
+        case 'reload': mainWindow.webContents.reload(); break;
+        case 'forceReload': mainWindow.webContents.reloadIgnoringCache(); break;
+        case 'toggleDevTools': mainWindow.webContents.toggleDevTools(); break;
+        case 'toggleFullScreen': mainWindow.setFullScreen(!mainWindow.isFullScreen()); break;
+        case 'minimize': mainWindow.minimize(); break;
+        case 'zoom': if (mainWindow.isMaximized()) mainWindow.unmaximize(); else mainWindow.maximize(); break;
+        case 'close': mainWindow.close(); break;
+        case 'openExternal': shell.openExternal(url || 'https://incognide.com'); break;
+        case 'about':
+            dialog.showMessageBox(mainWindow, {
+                type: 'info',
+                title: 'About Incognide',
+                message: 'Incognide',
+                detail: `Version: ${app.getVersion()}\nElectron: ${process.versions.electron}\nChrome: ${process.versions.chrome}\nNode: ${process.versions.node}`
+            });
+            break;
+        default:
+            mainWindow.webContents.send(action);
+    }
+});
+
 let pdfView = null;
 let uiHidden = false;
 let frontendServer = null;
@@ -621,6 +684,8 @@ const ensureTablesExist = async () => {
       CREATE TABLE IF NOT EXISTS conversation_history (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           message_id TEXT UNIQUE NOT NULL,
+          parent_message_id TEXT,
+          branch_id TEXT,
           timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
           role TEXT NOT NULL,
           content TEXT,
@@ -633,7 +698,6 @@ const ensureTablesExist = async () => {
           reasoning_content TEXT,
           tool_calls TEXT,
           tool_results TEXT,
-          parent_message_id TEXT,
           params TEXT,
           input_tokens INTEGER,
           output_tokens INTEGER,
@@ -788,10 +852,93 @@ const ensureTablesExist = async () => {
       }
 
       console.log('[DB] All tables are ready.');
+
+      await backfillMissingCosts();
   } catch (error) {
       console.error('[DB] FATAL: Could not create tables.', error);
   }
 };
+
+async function backfillMissingCosts() {
+    const { spawnSync } = require('child_process');
+    const pythonScript = `
+import os, sys, sqlite3
+try:
+    from npcpy.gen.response import calculate_cost
+    import litellm
+except Exception as e:
+    print('npcpy/litellm import failed:', e)
+    sys.exit(1)
+db_path = sys.argv[1]
+conn = sqlite3.connect(db_path)
+conn.row_factory = sqlite3.Row
+cur = conn.cursor()
+# Backfill rows that already have tokens but no cost
+cur.execute("""
+    SELECT id, model, provider, input_tokens, output_tokens
+    FROM conversation_history
+    WHERE (input_tokens > 0 OR output_tokens > 0)
+      AND (cost IS NULL OR cost = '' OR cost = '0' OR cost = '0.0' OR cost = '0.0000' OR CAST(cost AS REAL) = 0.0)
+""")
+updated = 0
+for r in cur.fetchall():
+    try:
+        cost = calculate_cost(r['model'] or '', r['input_tokens'] or 0, r['output_tokens'] or 0, provider=r['provider'] or '')
+        if cost:
+            cur.execute('UPDATE conversation_history SET cost = ? WHERE id = ?', (str(cost), r['id']))
+            updated += 1
+    except Exception as e:
+        print('cost error:', e)
+# Estimate tokens for rows with content but NULL/zero tokens, then backfill cost
+cur.execute("""
+    SELECT id, role, model, provider, content, input_tokens, output_tokens
+    FROM conversation_history
+    WHERE (input_tokens IS NULL OR input_tokens = 0)
+      AND (output_tokens IS NULL OR output_tokens = 0)
+      AND (cost IS NULL OR cost = '' OR cost = '0' OR cost = '0.0' OR cost = '0.0000' OR CAST(cost AS REAL) = 0.0)
+      AND content IS NOT NULL AND content != ''
+      AND role IN ('user', 'assistant')
+""")
+estimated = 0
+for r in cur.fetchall():
+    try:
+        model = r['model'] or ''
+        provider = r['provider'] or ''
+        content = r['content'] or ''
+        if isinstance(content, bytes):
+            content = content.decode('utf-8', errors='ignore')
+        if not content.strip():
+            continue
+        full_model = f"{provider}/{model}" if provider and '/' not in model else model
+        if r['role'] == 'assistant':
+            out_tokens = litellm.token_counter(model=full_model, text=content) if content else 0
+            cur.execute('UPDATE conversation_history SET output_tokens = ?, input_tokens = COALESCE(input_tokens, 0) WHERE id = ?', (out_tokens, r['id']))
+            cost = calculate_cost(model, 0, out_tokens, provider=provider)
+        else:
+            in_tokens = litellm.token_counter(model=full_model, text=content) if content else 0
+            cur.execute('UPDATE conversation_history SET input_tokens = ?, output_tokens = COALESCE(output_tokens, 0) WHERE id = ?', (in_tokens, r['id']))
+            cost = calculate_cost(model, in_tokens, 0, provider=provider)
+        if cost:
+            cur.execute('UPDATE conversation_history SET cost = ? WHERE id = ?', (str(cost), r['id']))
+        estimated += 1
+    except Exception as e:
+        print('estimate error:', e)
+conn.commit()
+conn.close()
+print(f'backfilled {updated} costs, estimated {estimated} rows')
+`;
+    const tempPath = path.join(os.tmpdir(), `incognide-cost-backfill-${Date.now()}.py`);
+    try {
+        fs.writeFileSync(tempPath, pythonScript);
+        const result = spawnSync('python3', [tempPath, dbPath], { encoding: 'utf-8', timeout: 120000 });
+        if (result.stdout) console.log('[COST_BACKFILL]', result.stdout.trim());
+        if (result.stderr) console.error('[COST_BACKFILL]', result.stderr.trim());
+    } catch (err) {
+        console.error('[COST_BACKFILL] Failed:', err.message);
+    } finally {
+        try { fs.unlinkSync(tempPath); } catch {}
+    }
+}
 
 app.setAppUserModelId('com.incognide.chat');
 app.name = 'incognide';
@@ -980,22 +1127,55 @@ let _spawnArgs = [];
 let _backendEnv = null;
 let _backendStartupError = null;
 
-function killBackendProcess() {
-  if (backendProcess) {
-    log('Killing backend process');
+function waitForProcessExit(proc, timeoutMs) {
+  return new Promise((resolve) => {
+    if (!proc || proc.exitCode !== null || proc.killed) {
+      resolve(true);
+      return;
+    }
+    const onClose = () => resolve(true);
+    proc.once('close', onClose);
+    const timer = setTimeout(() => {
+      proc.removeListener('close', onClose);
+      resolve(false);
+    }, timeoutMs);
+  });
+}
+
+async function killBackendProcess() {
+  if (!backendProcess) return;
+  const proc = backendProcess;
+  log(`Killing backend process (pid ${proc.pid})`);
+  if (process.platform === 'win32') {
+    try {
+      execSync(`taskkill /T /PID ${proc.pid}`, { stdio: 'ignore', timeout: 3000 });
+    } catch (e) {
+      try { proc.kill('SIGTERM'); } catch (e2) {}
+    }
+  } else {
+    try { process.kill(-proc.pid, 'SIGTERM'); } catch (e) {
+      try { proc.kill('SIGTERM'); } catch (e2) {}
+    }
+  }
+
+  const exited = await waitForProcessExit(proc, 3000);
+  if (!exited) {
+    log('Backend did not exit after SIGTERM, escalating to SIGKILL');
     if (process.platform === 'win32') {
       try {
-        execSync(`taskkill /F /T /PID ${backendProcess.pid}`, { stdio: 'ignore' });
+        execSync(`taskkill /F /T /PID ${proc.pid}`, { stdio: 'ignore' });
       } catch (e) {
-        try { backendProcess.kill('SIGKILL'); } catch (e2) {}
+        try { proc.kill('SIGKILL'); } catch (e2) {}
       }
     } else {
-      try { process.kill(-backendProcess.pid, 'SIGTERM'); } catch (e) {
-        try { backendProcess.kill('SIGTERM'); } catch (e2) {}
+      try { process.kill(-proc.pid, 'SIGKILL'); } catch (e) {
+        try { proc.kill('SIGKILL'); } catch (e2) {}
       }
     }
-    backendProcess = null;
+    await waitForProcessExit(proc, 2000);
   }
+
+  backendProcess = null;
 }
 
 function setBackendProcess(proc) {
@@ -1213,7 +1393,6 @@ async function ensureBaseDir() {
   }
 }
 
-const sessionsWithDownloadHandler = new WeakSet();
 
 ipcMain.on('trigger-new-text-file', (event) => {
   event.sender.send('menu-new-text-file');
@@ -1625,35 +1804,10 @@ app.on('web-contents-created', (event, contents) => {
         } catch (e) {}
       }, 5000);
     });
+
+    setupWebContentsHandlers(contents, () => mainWindow, log);
   }
 
-  if (contents.getType() === 'webview') {
-    const session = contents.session;
-    if (session && !sessionsWithDownloadHandler.has(session)) {
-      sessionsWithDownloadHandler.add(session);
-
-      session.on('will-download', (e, item, webContents) => {
-        const url = item.getURL();
-        const filename = item.getFilename();
-
-        log(`[DOWNLOAD] Intercepted download: ${filename} from ${url}`);
-
-        item.cancel();
-
-        const dlParentWin = BrowserWindow.fromWebContents(webContents.hostWebContents || webContents)
-          || BrowserWindow.getFocusedWindow()
-          || BrowserWindow.getAllWindows()[0];
-        if (dlParentWin && !dlParentWin.isDestroyed()) {
-          dlParentWin.webContents.send('browser-download-requested', {
-            url,
-            filename,
-            mimeType: item.getMimeType(),
-            totalBytes: item.getTotalBytes()
-          });
-        }
-      });
-    }
-  }
 });
 
 async function deployIncognideTeamOnStartup() {
@@ -1957,7 +2111,7 @@ window.__addLog = function(msg) {
         exitCode,
         timestamp: new Date().toISOString(),
       };
-      killBackendProcess();
+      await killBackendProcess();
     } else {
       _backendStartupError = null;
     }
@@ -2233,8 +2387,9 @@ function registerGlobalShortcut(win) {
           movable: false,
           hasShadow: false,
           webPreferences: {
-            nodeIntegration: true,
-            contextIsolation: false
+            nodeIntegration: false,
+            contextIsolation: true,
+            preload: path.join(__dirname, 'renderer/components/selection-preload.js')
           }
         });
         selectionWindow.setIgnoreMouseEvents(false);
@@ -2284,118 +2439,7 @@ function registerGlobalShortcut(win) {
           isCapturingScreenshot = false;
         });
 
-        const selectionHtml = `
-          <!DOCTYPE html>
-          <html>
-          <head>
-            <style>
-              * { margin: 0; padding: 0; box-sizing: border-box; }
-              body {
-                overflow: hidden;
-                cursor: crosshair;
-                user-select: none;
-                background: transparent;
-              }
-              #overlay {
-                position: fixed;
-                top: 0;
-                left: 0;
-                width: 100vw;
-                height: 100vh;
-                background: rgba(0, 0, 0, 0.15);
-              }
-              #selection {
-                position: fixed;
-                border: 2px dashed #00aaff;
-                background: rgba(0, 170, 255, 0.1);
-                display: none;
-                pointer-events: none;
-              }
-              #dimensions {
-                position: fixed;
-                background: rgba(0, 0, 0, 0.7);
-                color: white;
-                padding: 4px 8px;
-                border-radius: 4px;
-                font-family: system-ui, sans-serif;
-                font-size: 12px;
-                display: none;
-                pointer-events: none;
-              }
-            </style>
-          </head>
-          <body>
-            <div id="overlay"></div>
-            <div id="selection"></div>
-            <div id="dimensions"></div>
-            <script>
-              const { ipcRenderer } = require('electron');
-
-              let startX, startY, isSelecting = false;
-              const selection = document.getElementById('selection');
-              const dimensions = document.getElementById('dimensions');
-
-              document.addEventListener('mousedown', (e) => {
-                startX = e.clientX;
-                startY = e.clientY;
-                isSelecting = true;
-                selection.style.display = 'block';
-                dimensions.style.display = 'block';
-                selection.style.left = startX + 'px';
-                selection.style.top = startY + 'px';
-                selection.style.width = '0px';
-                selection.style.height = '0px';
-              });
-
-              document.addEventListener('mousemove', (e) => {
-                if (!isSelecting) return;
-
-                const currentX = e.clientX;
-                const currentY = e.clientY;
-
-                const left = Math.min(startX, currentX);
-                const top = Math.min(startY, currentY);
-                const width = Math.abs(currentX - startX);
-                const height = Math.abs(currentY - startY);
-
-                selection.style.left = left + 'px';
-                selection.style.top = top + 'px';
-                selection.style.width = width + 'px';
-                selection.style.height = height + 'px';
-
-                dimensions.style.left = (left + width + 5) + 'px';
-                dimensions.style.top = (top + height + 5) + 'px';
-                dimensions.textContent = width + ' x ' + height;
-              });
-
-              document.addEventListener('mouseup', (e) => {
-                if (!isSelecting) return;
-                isSelecting = false;
-
-                const rect = selection.getBoundingClientRect();
-                if (rect.width > 5 && rect.height > 5) {
-                  ipcRenderer.send('selection-complete', {
-                    x: rect.left,
-                    y: rect.top,
-                    width: rect.width,
-                    height: rect.height
-                  });
-                } else {
-                  ipcRenderer.send('selection-cancel');
-                }
-              });
-
-              document.addEventListener('keydown', (e) => {
-                if (e.key === 'Escape') {
-                  ipcRenderer.send('selection-cancel');
-                }
-              });
-            </script>
-          </body>
-          </html>
-        `;
-
-        selectionWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(selectionHtml));
+        selectionWindow.loadFile(path.join(__dirname, 'renderer/components/selection.html'));
 
       } catch (error) {
         console.error('Screenshot capture failed:', error);
@@ -2710,6 +2754,7 @@ function createWindow(cliArgs = {}) {
 
     const windowState = clampWindowStateToDisplays(loadWindowState());
 
+    const isMac = process.platform === 'darwin';
     mainWindow = new BrowserWindow({
       width: windowState.width,
       height: windowState.height,
@@ -2718,14 +2763,14 @@ function createWindow(cliArgs = {}) {
       show: false,
       icon: appIcon || iconPath,
       title: 'Incognide',
+      titleBarStyle: isMac ? 'hiddenInset' : 'hidden',
+      ...(isMac ? { trafficLightPosition: { x: 12, y: 8 } } : {}),
       webPreferences: {
-        nodeIntegration: true,
+        nodeIntegration: false,
         contextIsolation: true,
         webSecurity: false,
         webviewTag: true,
         plugins: true,
-        enableRemoteModule: true,
-        nodeIntegrationInSubFrames: true,
         allowRunningInsecureContent: true,
         experimentalFeatures: true,
         preload: path.join(__dirname, 'preload.js')
@@ -2740,9 +2785,15 @@ function createWindow(cliArgs = {}) {
       if (windowState.maximized) {
         mainWindow.maximize();
       }
+      if (IS_DEV_MODE) {
+        mainWindow.webContents.openDevTools({ mode: 'detach' });
+      }
     });
 
     const win = mainWindow;
+    win.on('maximize', () => win.webContents.send('window-state-changed', { isMaximized: true }));
+    win.on('unmaximize', () => win.webContents.send('window-state-changed', { isMaximized: false }));
+
     let saveStateTimeout;
     const doSaveWindowState = () => {
       try {
@@ -2769,6 +2820,14 @@ function createWindow(cliArgs = {}) {
       callback(true);
     });
 
+    mainWindow.webContents.on('render-process-gone', (event, details) => {
+      console.error('[RENDERER CRASH]', details);
+    });
+    mainWindow.webContents.on('console-message', (event, level, message, line, sourceId) => {
+      const prefix = `[CONSOLE ${['debug','info','warn','error'][level] || level}]`;
+      console.log(prefix, message, sourceId ? `(${sourceId}:${line})` : '');
+    });
+
     if (process.platform === 'darwin') {
       mainWindow.on('swipe', (event, direction) => {
         if (direction === 'left') mainWindow.webContents.send('browser-swipe-back');
@@ -2776,10 +2835,6 @@ function createWindow(cliArgs = {}) {
       });
     }
 
-    mainWindow.webContents.session.protocol.registerFileProtocol('file', (request, callback) => {
-      const pathname = decodeURI(request.url.replace('file:///', ''));
-      callback(pathname);
-    });
     setTimeout(() => {
       if (appIcon && !appIcon.isEmpty()) {
         mainWindow.setIcon(appIcon);
@@ -2837,7 +2892,7 @@ applyAppMenu();
           "style-src-elem 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://js.stripe.com https://fonts.googleapis.com https://www.google.com https://www.gstatic.com https://accounts.google.com https://accounts.youtube.com; " +
           "img-src 'self' data: file: media: blob: http: https:; " +
           "font-src 'self' data: https://cdn.jsdelivr.net https://fonts.gstatic.com; " +
-          `connect-src 'self' file: media: http://localhost:${FRONTEND_PORT} http://127.0.0.1:${BACKEND_PORT} ${BACKEND_URL} blob: ws: wss: https://* http://*; ` +
+          `connect-src 'self' file: media: http://localhost:${FRONTEND_PORT} http://127.0.0.1:${BACKEND_PORT} ${BACKEND_URL} ${IS_DEV_MODE ? 'http://127.0.0.1:8080 ' : ''}blob: ws: wss: https://* http://*; ` +
           "frame-src 'self' file: data: blob: media: chrome-extension: https://js.stripe.com https://m.stripe.network https://checkout.stripe.com https://*.clerk.accounts.dev https://clerk.app.incognide.com https://accounts.youtube.com https://accounts.google.com https://www.google.com https://www.gstatic.com; " +
           "object-src 'self' file: data: blob: media: chrome-extension:; " +
           "worker-src 'self' blob: data:; " +
@@ -3030,6 +3085,20 @@ applyAppMenu();
     mainWindow.webContents.on('before-input-event', (event, input) => {
       if (input.type === 'keyDown') {
 
+        if (input.control && !input.shift && !input.alt && input.key.toLowerCase() === 'tab') {
+          console.log('[CYCLE-MAIN] forward');
+          event.preventDefault();
+          mainWindow.webContents.send('menu-cycle-pane-forward');
+          return;
+        }
+
+        if (input.control && input.shift && !input.alt && input.key.toLowerCase() === 'tab') {
+          console.log('[CYCLE-MAIN] backward');
+          event.preventDefault();
+          mainWindow.webContents.send('menu-cycle-pane-backward');
+          return;
+        }
+
         if (input.control && !input.shift && !input.alt && input.key.toLowerCase() === 't') {
           event.preventDefault();
           mainWindow.webContents.send('browser-new-tab');
@@ -3138,6 +3207,8 @@ registerAll({
   electronLogPath,
   backendLogPath,
   ensureTablesExist,
+  getSharedDb,
+  closeSharedDb,
   appDir: __dirname,
   INCOGNIDE_BASE,
   INCOGNIDE_HOME,
@@ -3483,7 +3554,7 @@ ipcMain.handle('backend:installAndStart', async (event, { pythonPath, npcpyExtra
 
     sendProgress('Installation complete. Starting backend...');
 
-    killBackendProcess();
+    await killBackendProcess();
     await new Promise(resolve => setTimeout(resolve, 500));
 
     _backendEnv = {
@@ -3526,22 +3597,66 @@ ipcMain.handle('backend:installAndStart', async (event, { pythonPath, npcpyExtra
   }
 });
 
+ipcMain.handle('reload-window', async (event) => {
+  try {
+    const senderWindow = BrowserWindow.fromWebContents(event.sender);
+    if (senderWindow && !senderWindow.isDestroyed()) {
+      senderWindow.webContents.reloadIgnoringCache();
+    }
+    return { success: true };
+  } catch (err) {
+    log(`reload-window error: ${err.message}`);
+    return { success: false, error: err.message };
+  }
+});
+
 ipcMain.handle('backend:restart', async () => {
   try {
     log('Backend restart requested by renderer');
-    killBackendProcess();
 
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    // Confirm the old process is gone before spawning, so the port is actually
+    // free and waitForServer can't false-positive against the dying server.
+    await killBackendProcess();
+    await new Promise(resolve => setTimeout(resolve, 500));
+
+    // If spawn config is missing (e.g. dev mode using a manually-started server),
+    // re-derive it from the persisted python path + the standard env template.
     if (!_backendPath || !_backendEnv) {
-      return { success: false, error: 'Backend spawn config not available' };
+      const savedPython = getBackendPythonPath();
+      if (!savedPython) {
+        return { success: false, error: 'Backend spawn config not available and no saved python path' };
+      }
+      _backendPath = savedPython;
+      _backendEnv = {
+        ...process.env,
+        INCOGNIDE_PORT: String(BACKEND_PORT),
+        INCOGNIDE_FRONTEND_PORT: String(FRONTEND_PORT),
+        INCOGNIDE_KG_REGISTRY: path.join(INCOGNIDE_HOME, 'kg_registry.yaml'),
+        FLASK_DEBUG: '1',
+        PYTHONUNBUFFERED: '1',
+        PYTHONIOENCODING: 'utf-8',
+        HOME: os.homedir(),
+        INCOGNIDE_BASE: path.join(os.homedir(), '.incognide'),
+        INCOGNIDE_HOME: INCOGNIDE_HOME,
+        INCOGNIDE_DATA_DIR: path.join(INCOGNIDE_HOME, 'data'),
+      };
+      _spawnArgs = ['-m', 'npcpy.serve'];
     }
+
     backendProcess = spawnBackendProcess(_backendPath, _spawnArgs, 'restart', _backendEnv);
-    const ready = await waitForServer(30, 1000);
-    if (ready) {
+
+    // Pass the new process to waitForServer so it can detect an early exit.
+    const ready = await waitForServer(45, 1000, backendProcess);
+
+    // Ensure health came from the new process, not the old still-dying one.
+    if (ready && backendProcess && backendProcess.exitCode === null) {
       log('Backend restarted successfully');
       return { success: true };
     } else {
       log('Backend restart failed — server did not become ready');
+      if (backendProcess && backendProcess.exitCode !== null) {
+        log(`New backend process exited with code ${backendProcess.exitCode}`);
+      }
       return { success: false, error: 'Server did not start in time' };
     }
   } catch (err) {
@@ -3551,9 +3666,13 @@ ipcMain.handle('backend:restart', async () => {
 });
 
 app.on('before-quit', () => {
+  closeSharedDb();
   if (backendProcess) {
     log('Killing backend process (before-quit)');
-    killBackendProcess();
+    // Synchronous event: start the async kill and let the OS reap the child
+    // after the app exits. This is still better than the old fire-and-forget
+    // immediate nulling because we actually send the signal and listen for exit.
+    killBackendProcess().catch(err => log('before-quit kill error:', err));
   }
 });
 

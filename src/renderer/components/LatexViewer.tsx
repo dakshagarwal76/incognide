@@ -1,4 +1,5 @@
 import { getFileName, generateId } from './utils';
+import { writeFileContent } from '../api/fileSystem';
 import React, { useEffect, useState, useCallback, useMemo, memo, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import {
@@ -715,6 +716,10 @@ const LatexViewer = ({
 
     const [content, setContentRaw] = useState(() => paneData?.fileContent || '');
     const [hasChangesRaw, setHasChangesRaw] = useState(() => paneData?.fileChanged || false);
+    const contentRef = useRef(content);
+    contentRef.current = content;
+    const hasChangesRef = useRef(hasChangesRaw);
+    hasChangesRef.current = hasChangesRaw;
     const hasChanges = hasChangesRaw;
     const setHasChanges = useCallback((val: boolean | ((prev: boolean) => boolean)) => {
         setHasChangesRaw(prev => {
@@ -888,7 +893,7 @@ const LatexViewer = ({
             try {
                 selfWritingRef.current = true;
                 lastWrittenContentRef.current = content;
-                await (window as any).api.writeFileContent(currentFilePath, content);
+                await writeFileContent(currentFilePath, content, 'manual');
                 setHasChanges(false);
                 setShowSavedFlash(true);
                 setTimeout(() => setShowSavedFlash(false), 1500);
@@ -1324,10 +1329,6 @@ const LatexViewer = ({
         load();
     }, [filePath]);
 
-    const contentRef = useRef(content);
-    contentRef.current = content;
-    const hasChangesRef = useRef(hasChanges);
-    hasChangesRef.current = hasChanges;
     const selfWritingRef = useRef(false);
     useEffect(() => {
         if (!filePath) return;
@@ -1523,7 +1524,7 @@ const LatexViewer = ({
         if (isUntitled && currentPath) {
             const savePath = `${currentPath}/${newName}`;
             try {
-                await (window as any).api.writeFileContent(savePath, content);
+                await writeFileContent(savePath, content, 'manual');
                 if (contentDataRef.current[nodeId]) {
                     contentDataRef.current[nodeId].contentId = savePath;
                     contentDataRef.current[nodeId].isUntitled = false;
@@ -1579,7 +1580,7 @@ const LatexViewer = ({
         try {
             selfWritingRef.current = true;
             lastWrittenContentRef.current = content;
-            await (window as any).api.writeFileContent(savePath, content);
+            await writeFileContent(savePath, content, 'manual');
             setHasChanges(false);
             const newStats = await checkDiskState(savePath);
             updateDiskState(content, newStats.mtime);
@@ -1596,9 +1597,10 @@ const LatexViewer = ({
     }, [hasChanges, content, filePath, currentPath, nodeId, contentDataRef, checkDiskState, updateDiskState]);
 
     useEffect(() => {
-        if (!hasChanges || !filePath || isSaving) return;
-        if (pendingDiskConflictRef.current) return;
-        const timer = setTimeout(async () => {
+        if (!filePath) return;
+        const timer = setInterval(async () => {
+            if (!hasChangesRef.current || pendingDiskConflictRef.current) return;
+            const currentContent = contentRef.current;
             try {
                 const { mtime } = await checkDiskState(filePath);
                 if (diskMtimeRef.current != null && mtime !== 0 && mtime !== diskMtimeRef.current) {
@@ -1608,19 +1610,30 @@ const LatexViewer = ({
                     return;
                 }
                 selfWritingRef.current = true;
-                lastWrittenContentRef.current = content;
-                await (window as any).api.writeFileContent(filePath, content);
+                lastWrittenContentRef.current = currentContent;
+                await writeFileContent(filePath, currentContent, 'autosave');
                 setHasChanges(false);
                 const newStats = await checkDiskState(filePath);
-                updateDiskState(content, newStats.mtime);
+                updateDiskState(currentContent, newStats.mtime);
                 setDiskChangeContent(null);
                 setTimeout(() => { selfWritingRef.current = false; }, 4000);
             } catch (e) {
                 selfWritingRef.current = false;
             }
-        }, 30000);  // 30s idle before autosave — explicit Cmd+S / Compile still save instantly
-        return () => clearTimeout(timer);
-    }, [content, hasChanges, filePath, isSaving, checkDiskState, updateDiskState]);
+        }, 30000);
+        return () => {
+            clearInterval(timer);
+            if (hasChangesRef.current) {
+                const currentContent = contentRef.current;
+                selfWritingRef.current = true;
+                lastWrittenContentRef.current = currentContent;
+                writeFileContent(filePath, currentContent, 'autosave').catch(() => {});
+                setHasChanges(false);
+                checkDiskState(filePath).then(s => updateDiskState(currentContent, s.mtime)).catch(() => {});
+                setTimeout(() => { selfWritingRef.current = false; }, 4000);
+            }
+        };
+    }, [filePath, nodeId, contentDataRef, checkDiskState, updateDiskState]);
 
     const openPdfInSplit = useCallback((pdfPath: string) => {
         const existing = Object.keys(contentDataRef.current).find(
@@ -1649,7 +1662,7 @@ const LatexViewer = ({
             try {
                 selfWritingRef.current = true;
                 lastWrittenContentRef.current = content;
-                await (window as any).api.writeFileContent(filePath, content);
+                await writeFileContent(filePath, content, 'manual');
                 setHasChanges(false);
                 const newStats = await checkDiskState(filePath || '');
                 updateDiskState(content, newStats.mtime);

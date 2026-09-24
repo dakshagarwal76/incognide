@@ -7,7 +7,7 @@ import {
     Image as ImageIcon, Tag, Folder, Users, Settings, Images, BookOpen,
     FolderCog, HardDrive, Tags, Network, LayoutDashboard, Share2, Maximize2, Minimize2,
     FlaskConical, HelpCircle, Search, Music, Save, ZoomIn, ZoomOut, RotateCw, RefreshCw,
-    Box, Grid3X3, Eye, EyeOff, RotateCcw, Video
+    Box, Grid3X3, Eye, EyeOff, RotateCcw, Video, History
 } from 'lucide-react';
 import PaneHeader from './PaneHeader';
 import PaneTabBar from './PaneTabBar';
@@ -15,6 +15,7 @@ import { getFileName, getFileIcon } from './utils';
 import ChatInput from './ChatInput';
 import AgentInput from './AgentInput';
 import DiffViewer from './DiffViewer';
+import FileVersionsPane from './FileVersionsPane';
 import { ChatHeaderContent } from './pane-headers';
 
 const generateLayoutId = () => `layout-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -300,8 +301,6 @@ export const LayoutNode = memo(({ node, path, component: componentRef }) => {
             findNodePath, rootLayoutNode, setPaneContextMenu, closeContentPane,
 
             autoScrollEnabled, setAutoScrollEnabled,
-            messageSelectionMode, toggleMessageSelectionMode, selectedMessages,
-            conversationBranches, showBranchingUI, setShowBranchingUI,
 
             getChatInputProps,
 
@@ -338,7 +337,9 @@ export const LayoutNode = memo(({ node, path, component: componentRef }) => {
             if (!emitter) return;
             const handler = (e: any) => {
                 if (e.detail?.paneId === node.id || e.detail?.paneId === 'all') {
+                    const start = performance.now();
                     forceRender(n => n + 1);
+                    console.log(`[RENDER] pane ${node.id} forceRender took`, (performance.now() - start).toFixed(2), 'ms');
                 }
             };
             emitter.addEventListener('pane-update', handler);
@@ -1296,12 +1297,12 @@ export const LayoutNode = memo(({ node, path, component: componentRef }) => {
         } else if (contentType === 'tilejinx') {
             headerIcon = <Zap size={14} className="text-amber-400" />;
             headerTitle = contentId?.replace('.jinx', '') || 'Tile';
-        } else if (contentType === 'branches') {
-            headerIcon = <GitBranch size={14} className="text-purple-400" />;
-            headerTitle = 'Branch Comparison';
         } else if (contentType === 'diff') {
             headerIcon = <GitBranch size={14} className="text-orange-400" />;
             headerTitle = `Diff: ${getFileName(contentId) || 'File'}`;
+        } else if (contentType === 'file_versions') {
+            headerIcon = <History size={14} className="text-blue-400" />;
+            headerTitle = `Versions: ${getFileName(contentId) || 'File'}`;
         } else if (contentId) {
             headerIcon = getFileIcon(contentId);
             headerTitle = getFileName(contentId);
@@ -1339,6 +1340,19 @@ export const LayoutNode = memo(({ node, path, component: componentRef }) => {
                         title="Save file (Ctrl+S)"
                     >
                         <Save size={12} />
+                    </button>
+                    <button
+                        onClick={(e) => {
+                            e.stopPropagation();
+                            const nodePath = findNodePath(rootLayoutNode, node.id);
+                            if (nodePath) {
+                                performSplit(nodePath, 'right', 'file_versions', contentId);
+                            }
+                        }}
+                        className="p-1 rounded text-xs theme-button theme-hover"
+                        title="View file version history"
+                    >
+                        <History size={12} />
                     </button>
                     {isMarkdownFile && (
                         <button
@@ -1430,6 +1444,15 @@ export const LayoutNode = memo(({ node, path, component: componentRef }) => {
             );
         }
 
+        const chatScrollRef = useRef<HTMLDivElement>(null);
+        const chatMessages = paneData?.chatMessages?.messages || [];
+        const lastMessage = chatMessages.length > 0 ? chatMessages[chatMessages.length - 1] : null;
+        const lastMessageContent = lastMessage?.content || '';
+        const lastMessageReasoning = lastMessage?.reasoningContent || '';
+        const lastMessageToolCalls = lastMessage?.toolCalls || [];
+        const lastMessageContentParts = lastMessage?.contentParts || [];
+        const lastMessageStreaming = !!lastMessage?.isStreaming;
+
         if (contentType === 'chat' || contentType === 'agent') {
             const chatStats = paneData?.chatStats || { messageCount: 0, inputTokens: 0, outputTokens: 0, totalCost: 0, models: new Set(), agents: new Set(), providers: new Set() };
             const shortId = paneData?.contentId ? String(paneData.contentId).slice(-6) : '';
@@ -1452,29 +1475,18 @@ export const LayoutNode = memo(({ node, path, component: componentRef }) => {
                     chatStats={chatStats}
                     autoScrollEnabled={autoScrollEnabled}
                     setAutoScrollEnabled={setAutoScrollEnabled}
-                    messageSelectionMode={messageSelectionMode}
-                    toggleMessageSelectionMode={toggleMessageSelectionMode}
-                    selectedMessages={selectedMessages}
-                    showBranchingUI={showBranchingUI}
-                    setShowBranchingUI={setShowBranchingUI}
                     topBarCollapsed={topBarCollapsed}
                     onExpandTopBar={onExpandTopBar}
-                    conversationBranches={conversationBranches}
+                    isStreaming={lastMessageStreaming}
                 />
             );
         }
-
-        const chatScrollRef = useRef<HTMLDivElement>(null);
-        const chatMessages = paneData?.chatMessages?.messages || [];
-        const lastMessage = chatMessages.length > 0 ? chatMessages[chatMessages.length - 1] : null;
-        const lastMessageContent = lastMessage?.content || '';
-        const lastMessageReasoning = lastMessage?.reasoningContent || '';
 
         useEffect(() => {
             if (autoScrollEnabled && chatScrollRef.current && (contentType === 'chat' || contentType === 'agent')) {
                 chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
             }
-        }, [chatMessages.length, lastMessageContent, lastMessageReasoning, autoScrollEnabled, contentType]);
+        }, [chatMessages.length, lastMessageContent, lastMessageReasoning, lastMessageToolCalls, lastMessageContentParts, lastMessageStreaming, lastMessage?.id, autoScrollEnabled, contentType]);
 
         if (tabs.length > 1) {
             tabs.forEach((tab, index) => {
@@ -1545,7 +1557,7 @@ export const LayoutNode = memo(({ node, path, component: componentRef }) => {
                     const InputComponent = tabContentType === 'agent' ? AgentInput : ChatInput;
                     return (
                         <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
-                            <div ref={chatScrollRef} className="flex-1 min-h-0 overflow-y-auto">
+                            <div ref={chatScrollRef} className="flex-1 min-h-0 overflow-y-auto relative">
                                 {paneRenderers.chat?.({ nodeId: node.id })}
                             </div>
                             {chatInputProps && (
@@ -1630,6 +1642,14 @@ export const LayoutNode = memo(({ node, path, component: componentRef }) => {
                     <DiffViewer
                         filePath={contentId || ''}
                         diffStatus={paneData?.diffStatus}
+                        currentPath={currentPath}
+                    />
+                );
+            }
+            if (contentType === 'file_versions') {
+                return (
+                    <FileVersionsPane
+                        filePath={contentId || ''}
                         currentPath={currentPath}
                     />
                 );

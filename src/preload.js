@@ -20,6 +20,7 @@ readPdfText: (filePath) =>
   ipcRenderer.invoke('read-pdf-text', filePath),
     getDefaultConfig: () => ipcRenderer.invoke('getDefaultConfig'),
     getProjectCtx: (currentPath) => ipcRenderer.invoke('getProjectCtx', currentPath),
+    reloadWindow: () => ipcRenderer.invoke('reload-window'),
     readDirectoryStructure: (dirPath, options) => ipcRenderer.invoke('readDirectoryStructure', dirPath, options),
     goUpDirectory: (currentPath) => ipcRenderer.invoke('goUpDirectory', currentPath),
     readDirectory: (dirPath) => ipcRenderer.invoke('readDirectory', dirPath),
@@ -33,6 +34,24 @@ readPdfText: (filePath) =>
     checkBinaries: (names) => ipcRenderer.invoke('check-binaries', names),
     detectProviderKeys: () => ipcRenderer.invoke('detect-provider-keys'),
     getKnownProviders: () => ipcRenderer.invoke('get-known-providers'),
+
+    // OrcaRouter. Credentials never cross this bridge: these calls return model
+    // metadata and status only, and the API key stays in the main process.
+    orcaRouterInfo: () => ipcRenderer.invoke('orcarouter:provider-info'),
+    orcaRouterCredentialStatus: () => ipcRenderer.invoke('orcarouter:credential-status'),
+    orcaRouterLoginStart: (payload) => ipcRenderer.invoke('orcarouter:login-start', payload),
+    orcaRouterLoginCancel: (attemptId) => ipcRenderer.invoke('orcarouter:login-cancel', attemptId),
+    orcaRouterLoginState: () => ipcRenderer.invoke('orcarouter:login-state'),
+    orcaRouterDisconnect: () => ipcRenderer.invoke('orcarouter:disconnect'),
+    orcaRouterListModels: (payload) => ipcRenderer.invoke('orcarouter:list-models', payload),
+    orcaRouterSeedModels: (payload) => ipcRenderer.invoke('orcarouter:seed-models', payload),
+    orcaRouterValidateModel: (payload) => ipcRenderer.invoke('orcarouter:validate-model', payload),
+    orcaRouterReportAuthFailure: (payload) => ipcRenderer.invoke('orcarouter:report-auth-failure', payload),
+    onOrcaRouterLoginEvent: (callback) => {
+        const handler = (_, data) => callback(data);
+        ipcRenderer.on('orcarouter:login-event', handler);
+        return () => ipcRenderer.removeListener('orcarouter:login-event', handler);
+    },
     runInstallCommand: (cmd) => ipcRenderer.invoke('run-install-command', cmd),
     onInstallProgress: (callback) => {
         const handler = (_, data) => callback(data);
@@ -309,6 +328,14 @@ readPdfText: (filePath) =>
         ipcRenderer.on('menu-close-tab', callback);
         return () => ipcRenderer.removeListener('menu-close-tab', callback);
     },
+    onCyclePaneForward: (callback) => {
+        ipcRenderer.on('menu-cycle-pane-forward', callback);
+        return () => ipcRenderer.removeListener('menu-cycle-pane-forward', callback);
+    },
+    onCyclePaneBackward: (callback) => {
+        ipcRenderer.on('menu-cycle-pane-backward', callback);
+        return () => ipcRenderer.removeListener('menu-cycle-pane-backward', callback);
+    },
     onMenuOpenSettings: (callback) => {
         ipcRenderer.on('menu-open-settings', callback);
         return () => ipcRenderer.removeListener('menu-open-settings', callback);
@@ -553,6 +580,10 @@ readPdfText: (filePath) =>
     knowledge_extractAndStore: (args) => ipcRenderer.invoke('knowledge:extractAndStore', args),
 
     logActivity: (args) => ipcRenderer.invoke('activity:log', args),
+    logActivityBatch: (args) => ipcRenderer.invoke('activity:log-batch', args),
+    recordVersion: (args) => ipcRenderer.invoke('versions:record', args),
+    listVersions: (args) => ipcRenderer.invoke('versions:list', args),
+    readVersion: (args) => ipcRenderer.invoke('versions:read', args),
     getActivities: (args) => ipcRenderer.invoke('activity:list', args),
     logAutocomplete: (args) => ipcRenderer.invoke('autocomplete:log', args),
     getAutocompleteStats: (args) => ipcRenderer.invoke('autocomplete:stats', args),
@@ -596,6 +627,7 @@ onTerminalClosed: (callback) => {
             throw error;
         }
     },
+    respondToPermission: (payload) => ipcRenderer.invoke('permission:respond', payload),
     attachActiveStream: (conversationId) => ipcRenderer.invoke('attachActiveStream', conversationId),
     resumeStreamDrain: (streamId) => ipcRenderer.invoke('resumeStreamDrain', streamId),
 
@@ -614,6 +646,7 @@ onTerminalClosed: (callback) => {
         ipcRenderer.on('stream-error', handler);
         return () => ipcRenderer.removeListener('stream-error', handler);
     },
+    onPaneQueueDrain: null,
 
     getMcpServers: (currentPath) => ipcRenderer.invoke('mcp:getServers', { currentPath }),
     startMcpServer: (args) => ipcRenderer.invoke('mcp:startServer', args),
@@ -623,6 +656,7 @@ onTerminalClosed: (callback) => {
     addMcpIntegration: (args) => ipcRenderer.invoke('mcp:addIntegration', args),
     showOpenDialog: (options) => ipcRenderer.invoke('show-open-dialog', options),
     showSaveDialog: (options) => ipcRenderer.invoke('show-save-dialog', options),
+    saveLocalFile: (filePath) => ipcRenderer.invoke('save-local-file', filePath),
     showBrowser: (args) => ipcRenderer.invoke('show-browser', args),
     hideBrowser: (args) => ipcRenderer.invoke('hide-browser', args),
     updateBrowserBounds: (args) => ipcRenderer.invoke('update-browser-bounds', args),
@@ -941,6 +975,12 @@ fileExists: (path) => ipcRenderer.invoke('file-exists', path),
     teamsRead: () => ipcRenderer.invoke('teams:read'),
     teamsWrite: (teams) => ipcRenderer.invoke('teams:write', teams),
     teamsScan: (currentPath) => ipcRenderer.invoke('teams:scan', currentPath),
+    teamUpdateProvider: (args) => ipcRenderer.invoke('team:update-provider', args),
+    onTeamConfigsUpdated: (callback) => {
+        const handler = (_, data) => callback(data);
+        ipcRenderer.on('team-configs-updated', handler);
+        return () => ipcRenderer.removeListener('team-configs-updated', handler);
+    },
     mcpGetServersForSidebar: (currentPath) => ipcRenderer.invoke('mcp:getServersForSidebar', currentPath),
 
     sshConnect: (config) => ipcRenderer.invoke('ssh:connect', config),
@@ -976,5 +1016,23 @@ fileExists: (path) => ipcRenderer.invoke('file-exists', path),
         ipcRenderer.on('ssh:disconnected', handler);
         return () => ipcRenderer.removeListener('ssh:disconnected', handler);
     },
+
+    windowControls: {
+        minimize: () => ipcRenderer.send('window-minimize'),
+        maximize: () => ipcRenderer.send('window-maximize'),
+        close: () => ipcRenderer.send('window-close'),
+        openDevTools: () => ipcRenderer.send('window-open-devtools'),
+        toggleDevTools: () => ipcRenderer.send('window-toggle-devtools'),
+    },
+    windowState: {
+        isMaximized: () => ipcRenderer.invoke('window-is-maximized'),
+    },
+    onWindowStateChange: (callback) => {
+        const handler = (_, data) => callback(data);
+        ipcRenderer.on('window-state-changed', handler);
+        return () => ipcRenderer.removeListener('window-state-changed', handler);
+    },
+
+    menuAction: (action, url) => ipcRenderer.send('menu-action', { action, url }),
 
 });

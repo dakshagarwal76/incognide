@@ -220,15 +220,7 @@ export function useLayoutManager({ trackActivity, openModeRef, paneUpdateEmitter
             if (!paneData.chatMessages) {
                 paneData.chatMessages = { messages: [], allMessages: [], displayedMessageCount: 20 };
             }
-            if (paneData.executionMode === undefined) {
-                const savedMode = localStorage.getItem('incognideExecutionMode');
-                paneData.executionMode = savedMode ? JSON.parse(savedMode) : 'chat';
-                paneData.selectedJinx = null;
-                paneData.showJinxDropdown = false;
-            }
-            if (newContentType === 'agent' && paneData.executionMode === 'chat') {
-                paneData.executionMode = 'tool_agent';
-            }
+            paneData.executionMode = newContentType === 'agent' ? 'tool_agent' : 'chat';
             if (skipMessageLoad) {
                 paneData.chatMessages.messages = [];
                 paneData.chatMessages.allMessages = [];
@@ -237,19 +229,21 @@ export function useLayoutManager({ trackActivity, openModeRef, paneUpdateEmitter
                 try {
                     const msgs = await (window as any).api.getConversationMessages(newContentId);
                     const assistantMsgs = msgs?.filter((m: any) => m.role === 'assistant') || [];
-                    console.log('[LOAD_MSGS] Total:', msgs?.length, 'Assistant msgs:', assistantMsgs.length,
-                        'With parentMessageId:', assistantMsgs.filter((m: any) => m.parentMessageId).length);
+                    console.log('[LOAD_MSGS] Total:', msgs?.length, 'Assistant msgs:', assistantMsgs.length);
                     if (assistantMsgs.length > 0) {
                         console.log('[LOAD_MSGS] Assistant message details:', assistantMsgs.map((m: any) => ({
                             id: String(m.message_id || '').slice(0, 8),
-                            parent: String(m.parentMessageId || 'NONE').slice(0, 8),
                             npc: m.npc
                         })));
                     }
                     const formatted = (msgs && Array.isArray(msgs))
                         ? msgs.map((m: any) => {
                             const msg = { ...m, id: m.message_id || m.id || generateId() };
-                            if (msg.role === 'assistant' && msg.toolCalls && Array.isArray(msg.toolCalls)) {
+                            // The main process (getConversationMessages) already builds
+                            // correctly-normalized contentParts — trust them. Only rebuild
+                            // when missing, and from the nested function shape.
+                            const hasUsableParts = Array.isArray(msg.contentParts) && msg.contentParts.length > 0;
+                            if (!hasUsableParts && msg.role === 'assistant' && msg.toolCalls && Array.isArray(msg.toolCalls)) {
                                 const contentParts: any[] = [];
                                 if (msg.reasoningContent) {
                                     contentParts.push({ type: 'reasoning', content: msg.reasoningContent });
@@ -262,9 +256,12 @@ export function useLayoutManager({ trackActivity, openModeRef, paneUpdateEmitter
                                         type: 'tool_call',
                                         call: {
                                             id: tc.id,
-                                            function_name: tc.function_name,
-                                            arguments: tc.arguments,
-                                            status: 'complete'
+                                            function: tc.function ?? {
+                                                name: tc.function_name ?? tc.name ?? 'unknown',
+                                                arguments: tc.arguments ?? '{}'
+                                            },
+                                            status: tc.status ?? 'complete',
+                                            result_preview: tc.result_preview
                                         }
                                     });
                                 });
@@ -310,12 +307,14 @@ export function useLayoutManager({ trackActivity, openModeRef, paneUpdateEmitter
             contentDataRef.current[targetPaneId] = {
                 ...contentDataRef.current[targetPaneId],
                 contentType: newContentType,
-                contentId: newContentId
+                contentId: newContentId,
+                executionMode: newContentType === 'agent' ? 'tool_agent' : (newContentType === 'chat' ? 'chat' : contentDataRef.current[targetPaneId].executionMode)
             };
         } else {
             contentDataRef.current[newPaneId] = {
                 contentType: newContentType,
-                contentId: newContentId
+                contentId: newContentId,
+                executionMode: newContentType === 'agent' ? 'tool_agent' : (newContentType === 'chat' ? 'chat' : undefined)
             };
         }
 
@@ -364,13 +363,33 @@ export function useLayoutManager({ trackActivity, openModeRef, paneUpdateEmitter
         }
     }, [updateContentPane]);
 
-    const closeContentPane = useCallback((paneId: string, nodePath?: number[]) => {
+    const closeContentPane = useCallback(async (paneId: string, nodePath?: number[]) => {
         const paneData = contentDataRef.current[paneId];
+
+        const triggerSaveFor = async (pane: any) => {
+            if (pane?.contentType === 'editor' || pane?.contentType === 'latex') {
+                if (pane?.fileChanged || pane?.hasChanges) {
+                    if (pane?.onSave) {
+                        try { await pane.onSave(); } catch {}
+                    }
+                }
+            }
+        };
 
         if (paneData && (paneData.fileChanged || paneData.hasChanges)) {
             const fileName = paneData.contentId?.split('/').pop() || 'this file';
-            if (!confirm(`"${fileName}" has unsaved changes. Close anyway?`)) {
-                return;
+            const isAutoSaveable = paneData.contentType === 'editor' || paneData.contentType === 'latex';
+            if (isAutoSaveable) {
+                await triggerSaveFor(paneData);
+                if (Array.isArray(paneData.tabs)) {
+                    for (const tab of paneData.tabs) {
+                        await triggerSaveFor(tab);
+                    }
+                }
+            } else {
+                if (!confirm(`"${fileName}" has unsaved changes. Close anyway?`)) {
+                    return;
+                }
             }
         }
 

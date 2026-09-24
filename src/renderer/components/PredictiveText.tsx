@@ -176,6 +176,13 @@ export const usePredictiveText = ({
             return;
         }
 
+        const isCodeMirrorEditor = activeElement.classList?.contains('cm-content') ||
+            activeElement.classList?.contains('cm-line') ||
+            activeElement.closest?.('.cm-editor');
+        if (isCodeMirrorEditor) {
+            return;
+        }
+
         const textContent = (activeElement as any).value || activeElement?.textContent || '';
         let cursorPosition = 0;
 

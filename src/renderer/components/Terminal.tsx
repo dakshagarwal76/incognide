@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, memo, useCallback, useState } from 'react';
+import { useKeystrokeLogger } from '../hooks/useKeystrokeLogger';
 import { createPortal } from 'react-dom';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
@@ -249,6 +250,13 @@ const TerminalView = ({ nodeId, contentDataRef, currentPath, activeContentPaneId
     const [pasteNotification, setPasteNotification] = useState<{ message: string; isError?: boolean } | null>(null);
     const pasteNotificationTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+    const { appendKeystrokes, flushAll, sessionId: ksSessionId } = useKeystrokeLogger();
+    const commandBufferRef = useRef<string>('');
+    const terminalTextRef = useRef<string>('');
+
+    useEffect(() => {
+        return () => { flushAll(); };
+    }, [flushAll]);
     const paneData = contentDataRef.current[nodeId];
     const terminalId = paneData?.contentId;
     const isRemoteSession = !!connectionId;
@@ -807,6 +815,33 @@ const TerminalView = ({ nodeId, contentDataRef, currentPath, activeContentPaneId
         }
         const inputHandler = xtermInstance.current.onData(input => {
             if (isSessionReady.current && !isEffectCancelled) {
+                const detail = terminalId || `terminal-${nodeId}`;
+                const sessionId = ksSessionId;
+                for (const ch of input) {
+                    const code = ch.charCodeAt(0);
+                    const isPrintable = code >= 32 || ch === '\n' || ch === '\r';
+                    const isControl = code < 32 && ch !== '\n' && ch !== '\r';
+                    const isEscape = ch === '\x1b' || ch === '\u001b';
+                    if (isPrintable && !isEscape && !isControl) {
+                        terminalTextRef.current += ch;
+                        commandBufferRef.current += ch;
+                    }
+                    if (ch === '\r' || ch === '\n') {
+                        const command = commandBufferRef.current.trim();
+                        if (command) {
+                            (window as any).api?.logActivity?.({
+                                type: 'terminal_command',
+                                data: { command, paneId: detail },
+                                sessionId,
+                            }).catch(() => {});
+                        }
+                        commandBufferRef.current = '';
+                        if (terminalTextRef.current) {
+                            appendKeystrokes('terminal', detail, terminalTextRef.current);
+                            terminalTextRef.current = '';
+                        }
+                    }
+                }
                 writeToSession(input);
             }
         });

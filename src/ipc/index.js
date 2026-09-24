@@ -11,6 +11,9 @@ const npc = require('./npc');
 const filesystem = require('./filesystem');
 const settings = require('./settings');
 const ssh = require('./ssh');
+const team = require('./team');
+const orcarouter = require('./orcarouter');
+const versions = require('./versions');
 
 function getIndexLocationFunctions() {
   return {
@@ -47,9 +50,12 @@ function registerAll(ctx) {
   chat.register(fullCtx);
   music.register(fullCtx);
   npc.register(fullCtx);
+  team.register(fullCtx);
   filesystem.register(fullCtx);
   settings.register(fullCtx);
   ssh.register(fullCtx);
+  orcarouter.register(fullCtx);
+  versions.register(fullCtx);
 }
 
 module.exports = {

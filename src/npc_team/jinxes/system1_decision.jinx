@@ -127,7 +127,8 @@ steps:
           output = json.dumps(results, indent=2)
 
       elif action == 'route':
-          from npcpy.gen.decision import decision_route
+          from npcpy.gen.decision import DecisionSystem1, DecisionRouter, decision_route
+          from npcpy.ft.system1 import System1Example
           instructions = str(context.get('instructions', 'Which tier should handle this state?'))
           raw_tiers = context.get('tiers', [])
           if isinstance(raw_tiers, str):
@@ -139,12 +140,40 @@ steps:
               criteria = json.loads(raw_criteria)
           else:
               criteria = raw_criteria
+          if not criteria:
+              criteria = {tier: tier for tier in tiers}
+          route_model_dir = model_dir
+          use_existing = False
+          try:
+              existing = DecisionSystem1(model_dir)
+              if existing.predictor is not None:
+                  resolved = existing.predictor._resolve_question_name('default')
+                  labels = set(existing.predictor.label_maps.get(resolved, []))
+                  if set(tiers).issubset(labels):
+                      use_existing = True
+          except Exception:
+              use_existing = False
+          if not use_existing:
+              route_model_dir = os.path.join(model_dir, '_route')
+              os.makedirs(route_model_dir, exist_ok=True)
+              router = DecisionRouter(tiers=tiers, criteria=criteria)
+              examples = []
+              for tier in tiers:
+                  examples.append(System1Example(
+                      state=router.criteria.get(tier, tier),
+                      question_type='choice',
+                      instructions=instructions,
+                      criteria={t: router.criteria.get(t, t) for t in tiers},
+                      answer={'choice': tier},
+                      question_name='default',
+                  ))
+              DecisionSystem1().train(examples, output_dir=route_model_dir)
           result = decision_route(
               state,
               instructions,
               tiers,
-              criteria=criteria if criteria else None,
-              model_path=model_dir,
+              criteria=criteria,
+              model_path=route_model_dir,
           )
           output = json.dumps(result, indent=2)
 

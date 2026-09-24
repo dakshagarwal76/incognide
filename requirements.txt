@@ -4,7 +4,9 @@ flask_sse
 redis
 pyyaml
 pillow
-npcpy>=2.1.14
+npcpy[system1]>=2.1.21
+sentence_transformers
+scikit-learn
 npcsh>=1.2.10
 anthropic
 google-genai
@@ -19,5 +21,5 @@ protobuf>=3.20.0,<4.0.0
 #   pip install --no-deps "git+https://github.com/NPC-Worldwide/qstk.git"
 qstkl
 huggingface_hub
-# Optional exact gradients for activity_predictor training:
-# torch
+# SSM (qstk.cnn) and exact gradients for activity_predictor training need torch.
+torch

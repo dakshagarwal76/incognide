@@ -1,9 +1,13 @@
 """Stable experiment-facing wrappers around the Activity Intelligence predictor.
 
+Supports two swappable decision backends:
+  - system1: npcpy.ft.system1 classifier on state-text + label examples.
+  - ssm: qstk.cnn sequence classifier preserving the SSM inductive bias.
+
 Experiment scripts should import training / inference / vocab helpers from here
-rather than reaching into ``qstk.cnn`` directly. That keeps synthetic eval,
-history ablation, and real-CSV analysis insulated when the studio action set
-or predictor internals change (e.g. the v0.2.30 standardization).
+rather than reaching into ``qstk.cnn`` or ``npcpy.ft.system1`` directly. That keeps
+synthetic eval, history ablation, and real-CSV analysis insulated when the studio
+action set or predictor internals change (e.g. the v0.2.30 standardization).
 
 Paper write-ups can stay private; this package is the public ML/experiment
 surface that belongs in the Incognide repo.
@@ -32,6 +36,14 @@ from activity_model.activity_predictor import (  # noqa: F401
     encode_activity,
     events_to_sequences,
     train_from_sequences,
+)
+
+from activity_model.decisioners import (  # noqa: F401
+    DecisionerConfig,
+    System1Decisioner,
+    SSMDecisioner,
+    activity_events_to_system1_examples,
+    get_decisioner,
 )
 
 SequencePair = Tuple[np.ndarray, int]
@@ -73,24 +85,88 @@ def train_and_save(
     val_data: List[SequencePair],
     model_dir: str,
     *,
+    backend: str = "ssm",
+    events: Optional[List[Dict[str, Any]]] = None,
     epochs: int = 50,
     lr: float = 1e-3,
     batch_size: int = 32,
     seed: Optional[int] = None,
     model_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Thin wrapper over ``train_from_sequences`` with experiment defaults."""
-    return train_from_sequences(
-        train_data,
-        val_data,
-        model_dir,
-        epochs=epochs,
-        lr=lr,
-        batch_size=batch_size,
-        seed=seed,
-        model_config=model_config,
-    )
+    """Thin wrapper over ``train_from_sequences`` with experiment defaults.
+
+    backend:
+      - "ssm"  : train the qstk.cnn sequence classifier.
+      - "system1": train an npcpy.ft.system1 classifier from raw events.
+    """
+    if backend == "ssm":
+        return train_from_sequences(
+            train_data,
+            val_data,
+            model_dir,
+            epochs=epochs,
+            lr=lr,
+            batch_size=batch_size,
+            seed=seed,
+            model_config=model_config,
+        )
+    if backend == "system1":
+        if events is None:
+            raise ValueError("system1 backend requires events list")
+        config = DecisionerConfig(
+            backend="system1",
+            model_dir=model_dir,
+            epochs=epochs,
+            lr=lr,
+            batch_size=batch_size,
+            seed=seed,
+        )
+        decisioner = System1Decisioner(config)
+        examples = activity_events_to_system1_examples(events)
+        return decisioner.fit(examples)
+    raise ValueError(f"Unknown backend: {backend}")
 
 
-def load_trained(model_dir: str) -> Dict[str, Any]:
-    return load_model(os.path.join(model_dir, "model.npz"))
+def load_trained(model_dir: str, backend: str = "ssm") -> Any:
+    if backend == "ssm":
+        return load_model(os.path.join(model_dir, "model.npz"))
+    if backend == "system1":
+        config = DecisionerConfig(backend="system1", model_dir=model_dir)
+        decisioner = System1Decisioner(config)
+        decisioner.predictor = decisioner._ensure_predictor()
+        return decisioner
+    raise ValueError(f"Unknown backend: {backend}")
+
+
+def predict_decisioner(
+    backend: str,
+    model_dir: str,
+    item: Any,
+    question_type: str = "choice",
+    instructions: str = "What is the next activity?",
+    criteria: Any = None,
+) -> Dict[str, Any]:
+    """Consult a trained decisioner and return a DecisionResult dict."""
+    if backend == "ssm":
+        config = DecisionerConfig(backend="ssm", model_dir=model_dir)
+        decisioner = SSMDecisioner(config)
+        if question_type == "choice":
+            return decisioner.decide_choice(item, instructions=instructions, criteria=criteria).to_dict()
+        if question_type == "score":
+            return decisioner.decide_score(item, instructions=instructions, criteria=criteria).to_dict()
+        if question_type == "noul":
+            return decisioner.decide_noul(item, instructions=instructions).to_dict()
+    if backend == "system1":
+        config = DecisionerConfig(backend="system1", model_dir=model_dir)
+        decisioner = System1Decisioner(config)
+        if question_type == "choice":
+            if criteria is None:
+                criteria = {a: a for a in ACTIVITY_TYPES}
+            return decisioner.decide_choice(item, instructions, criteria, question_name="default").to_dict()
+        if question_type == "score":
+            if criteria is None:
+                criteria = ACTIVITY_TYPES
+            return decisioner.decide_score(item, instructions, criteria, question_name="default").to_dict()
+        if question_type == "noul":
+            return decisioner.decide_noul(item, instructions, question_name="default").to_dict()
+    raise ValueError(f"Unknown backend: {backend}")

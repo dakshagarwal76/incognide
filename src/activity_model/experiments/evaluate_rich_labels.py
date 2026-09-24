@@ -33,6 +33,7 @@ from activity_model.experiments.api import (  # noqa: E402
     forward,
     load_model,
     make_predictor,
+    train_and_save,
     train_from_sequences,
 )
 from activity_model.experiments.evaluate import (  # noqa: E402
@@ -48,6 +49,11 @@ from activity_model.experiments.evaluate_real_csv import (  # noqa: E402
     navigation_events,
     split_sessions_temporal,
     type_histogram,
+)
+from activity_model.decisioners import (  # noqa: E402
+    DecisionerConfig,
+    System1Decisioner,
+    activity_events_to_system1_examples,
 )
 
 HOURS_PER_DAY = 24
@@ -495,6 +501,105 @@ def run_rich(
     return result
 
 
+def _events_to_rich_system1_examples(
+    events: List[Dict[str, Any]],
+    vocab: List[str],
+) -> List[Any]:
+    criteria = {lab: lab for lab in vocab}
+    return activity_events_to_system1_examples(
+        events,
+        question_type="choice",
+        instructions="What is the next rich activity label?",
+        criteria=criteria,
+        label_key="rich_label",
+    )
+
+
+def run_rich_system1(
+    events: List[Dict[str, Any]],
+    out_root: str,
+    seed: int,
+    epochs: int,
+    min_click_count: int,
+) -> Dict[str, Any]:
+    vocab, mapping = build_rich_vocab(events, min_click_count=min_click_count)
+    labeled = assign_rich_labels(events, mapping)
+    hist = Counter(e['rich_label'] for e in labeled)
+    n_classes = len(vocab)
+    print(f'[rich system1] events={len(labeled)} vocab={n_classes}')
+
+    splits, split_meta = split_sessions_temporal(labeled, min_session_len=5)
+
+    train_examples = _events_to_rich_system1_examples(splits['train'], vocab)
+    val_examples = _events_to_rich_system1_examples(splits['val'], vocab)
+    test_examples = _events_to_rich_system1_examples(splits['test'], vocab)
+
+    model_dir = os.path.join(out_root, 'models', 'rich_navigation_system1')
+    os.makedirs(model_dir, exist_ok=True)
+
+    decisioner = System1Decisioner(DecisionerConfig(
+        backend="system1",
+        model_dir=model_dir,
+        epochs=epochs,
+        seed=seed,
+    ))
+    fit_info = decisioner.fit(train_examples)
+
+    correct = 0
+    total = 0
+    per_class: Dict[str, Dict[str, int]] = {lab: {"tp": 0, "fp": 0, "fn": 0} for lab in vocab}
+    for ex in test_examples:
+        result = decisioner.decide_choice(
+            ex.state,
+            ex.instructions,
+            ex.criteria,
+            question_name="default",
+        )
+        true_label = ex.answer["choice"]
+        pred_label = result.choice
+        total += 1
+        if pred_label == true_label:
+            correct += 1
+            per_class[true_label]["tp"] += 1
+        else:
+            per_class[true_label]["fn"] += 1
+            per_class[pred_label]["fp"] += 1
+
+    top1 = correct / total if total else 0.0
+    f1s = {}
+    for lab, counts in per_class.items():
+        tp = counts["tp"]
+        fp = counts["fp"]
+        fn = counts["fn"]
+        prec = tp / (tp + fp) if (tp + fp) else 0.0
+        rec = tp / (tp + fn) if (tp + fn) else 0.0
+        f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) else 0.0
+        f1s[lab] = f1
+    macro_f1 = sum(f1s.values()) / len(f1s) if f1s else 0.0
+
+    return {
+        "view": "rich_navigation_system1",
+        "backend": "system1",
+        "n_events": len(labeled),
+        "vocab_size": n_classes,
+        "vocab": vocab,
+        "label_histogram": dict(hist.most_common()),
+        "split_meta": split_meta,
+        "window_counts": {
+            "train": len(train_examples),
+            "val": len(val_examples),
+            "test": len(test_examples),
+        },
+        "train_info": fit_info,
+        "model": {
+            "top1_accuracy": top1,
+            "macro_f1": macro_f1,
+            "n": total,
+            "per_class_f1": {k: v for k, v in sorted(f1s.items(), key=lambda kv: -kv[1]) if v > 0},
+        },
+    }
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description='Rich-label next-action eval on real CSV')
     parser.add_argument('--csv', type=str, default=os.path.join(_REPO_ROOT, 'activity_log.csv'))
@@ -512,34 +617,50 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument('--max-val-windows', type=int, default=1000)
     parser.add_argument('--min-click-count', type=int, default=10)
     parser.add_argument(
+        '--backend',
+        type=str,
+        default='ssm',
+        choices=['ssm', 'system1'],
+        help='Decision backend: ssm (qstk.cnn) or system1 (npcpy.ft.system1)',
+    )
+    parser.add_argument(
         '--out-root',
         type=str,
         default=os.path.join(_REPO_ROOT, 'experiments', 'activity_next_action', 'real_csv'),
     )
     args = parser.parse_args(argv)
 
-    history_lengths = [int(x) for x in args.history_lengths.split(',') if x.strip()]
     raw = load_events_from_csv(args.csv)
     known, dropped = filter_known_types(raw)
     nav = navigation_events(known)
 
-    result = run_rich(
-        events=nav,
-        out_root=args.out_root,
-        seed=args.seed,
-        sequence_length=args.sequence_length,
-        min_seq_len=args.min_seq_len,
-        epochs=args.epochs,
-        lr=args.lr,
-        batch_size=args.batch_size,
-        model_dim=args.model_dim,
-        state_dim=args.state_dim,
-        num_layers=args.num_layers,
-        history_lengths=history_lengths,
-        max_train_windows=args.max_train_windows,
-        max_val_windows=args.max_val_windows,
-        min_click_count=args.min_click_count,
-    )
+    if args.backend == 'system1':
+        result = run_rich_system1(
+            events=nav,
+            out_root=args.out_root,
+            seed=args.seed,
+            epochs=args.epochs,
+            min_click_count=args.min_click_count,
+        )
+    else:
+        history_lengths = [int(x) for x in args.history_lengths.split(',') if x.strip()]
+        result = run_rich(
+            events=nav,
+            out_root=args.out_root,
+            seed=args.seed,
+            sequence_length=args.sequence_length,
+            min_seq_len=args.min_seq_len,
+            epochs=args.epochs,
+            lr=args.lr,
+            batch_size=args.batch_size,
+            model_dim=args.model_dim,
+            state_dim=args.state_dim,
+            num_layers=args.num_layers,
+            history_lengths=history_lengths,
+            max_train_windows=args.max_train_windows,
+            max_val_windows=args.max_val_windows,
+            min_click_count=args.min_click_count,
+        )
 
     results_dir = os.path.join(args.out_root, 'results')
     os.makedirs(results_dir, exist_ok=True)
